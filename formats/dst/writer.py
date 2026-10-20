@@ -15,20 +15,12 @@ from pyembroidery import (
     JUMP,
     STITCH,
     EmbPattern,
-    EmbThread,
     write_dst,
 )
 
 from digitizer.model import EmbroideryDesign
 from digitizer.stitches.running.generator import generate_running_stitch
-
-
-def _hex_to_thread(hex_color: str) -> EmbThread:
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    thread = EmbThread()
-    thread.set_color(r, g, b)
-    return thread
+from formats.threads import hex_to_thread as _hex_to_thread
 
 
 def _object_stitch_points(obj) -> list[tuple[float, float]]:
