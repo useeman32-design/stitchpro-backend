@@ -47,6 +47,45 @@ class TestBuildLabelGrid:
         # bottom-left corner, far from the stripe, must read as background
         assert grid[39][0] == BACKGROUND_LABEL
 
+    def test_two_distinct_colors_survive_anti_aliased_downscale(self):
+        # Regression test: a large image with two clearly distinct
+        # foreground colors, downscaled with LANCZOS (the same resample
+        # pipeline.py's load_and_downscale uses), produces a halo of
+        # subtly-different near-white anti-aliased edge pixels. With a
+        # small max_colors budget, MEDIANCUT used to waste palette slots
+        # splitting that halo and collapse both real foreground colors into
+        # a single muddy average bucket. Both colors must survive.
+        big = Image.new("RGB", (300, 300), (255, 255, 255))
+        navy = (58, 49, 120)
+        gold = (212, 170, 80)
+        for y in range(40, 140):
+            for x in range(40, 260):
+                big.putpixel((x, y), navy)
+        for y in range(160, 260):
+            for x in range(40, 260):
+                big.putpixel((x, y), gold)
+        small = big.resize((60, 60), Image.LANCZOS)
+
+        palette, grid = build_label_grid(small, max_colors=4)
+        used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
+        used_colors = {palette[i] for i in used_labels}
+
+        def _closest(target):
+            return min(
+                used_colors,
+                key=lambda h: sum(
+                    (a - b) ** 2
+                    for a, b in zip(
+                        (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)), target
+                    )
+                ),
+            )
+
+        assert len(used_colors) >= 2
+        navy_match = _closest(navy)
+        gold_match = _closest(gold)
+        assert navy_match != gold_match
+
 
 class TestLabelGridToRingGroups:
     def _square_grid(self, w, h, label, x0, y0, x1, y1):

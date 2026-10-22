@@ -97,29 +97,48 @@ def build_label_grid(
     rgba = img.convert("RGBA")
     w, h = rgba.size
     bg_rgb = _detect_background_rgb(rgba)
+    rgba_pixels = rgba.load()
 
-    # Image.quantize() needs an RGB/P source; flatten onto white first for
-    # quantization purposes only (true transparency is handled separately
-    # below via the alpha channel, not lost here).
-    rgb_flat = Image.new("RGB", (w, h), (255, 255, 255))
-    rgb_flat.paste(rgba, mask=rgba.split()[3])
-    quantized = rgb_flat.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
+    # Classify background *before* quantizing, using the same alpha/distance
+    # rule the function has always used for its final label grid. This
+    # matters because MEDIANCUT otherwise sees the whole image -- including
+    # the halo of near-background anti-aliased edge pixels that downscaling
+    # (e.g. pipeline.py's LANCZOS resize) produces around every shape -- and
+    # can waste most or all of a small `max_colors` budget splitting hairs
+    # between many subtly-different near-white/near-background shades,
+    # instead of allocating palette slots to the real, visually distinct
+    # foreground colors. Excluding background pixels from the quantizer's
+    # input entirely fixes that: only genuine foreground pixels compete for
+    # palette slots.
+    fg_coords: list[tuple[int, int]] = []
+    fg_colors: list[Rgb] = []
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = rgba_pixels[x, y]
+            if a < alpha_threshold or _dist((r, g, b), bg_rgb) < bg_tolerance:
+                continue
+            fg_coords.append((x, y))
+            fg_colors.append((r, g, b))
+
+    label_grid: list[list[int]] = [[BACKGROUND_LABEL] * w for _ in range(h)]
+    if not fg_colors:
+        return [], label_grid
+
+    # Quantize just the foreground pixels, packed into a 1-D strip image --
+    # Image.quantize() needs an image, but the 2-D layout doesn't matter for
+    # palette generation, only the multiset of colors does.
+    fg_strip = Image.new("RGB", (len(fg_colors), 1))
+    fg_strip.putdata(fg_colors)
+    quantized = fg_strip.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
     q_palette = quantized.getpalette() or []
     q_pixels = quantized.load()
-    rgba_pixels = rgba.load()
 
     n_colors = min(max_colors, len(q_palette) // 3)
     palette_hex = [
         "#%02x%02x%02x" % tuple(q_palette[i * 3 : i * 3 + 3]) for i in range(n_colors)
     ]
 
-    label_grid: list[list[int]] = [[0] * w for _ in range(h)]
-    for y in range(h):
-        for x in range(w):
-            r, g, b, a = rgba_pixels[x, y]
-            if a < alpha_threshold or _dist((r, g, b), bg_rgb) < bg_tolerance:
-                label_grid[y][x] = BACKGROUND_LABEL
-            else:
-                label_grid[y][x] = q_pixels[x, y]
+    for i, (x, y) in enumerate(fg_coords):
+        label_grid[y][x] = q_pixels[i, 0]
 
     return palette_hex, label_grid
