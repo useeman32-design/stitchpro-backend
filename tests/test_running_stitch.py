@@ -123,7 +123,10 @@ def test_line_to_dst_roundtrip():
     assert commands[-1] == END or END in commands
 
     stitch_count = sum(1 for c in commands if c == STITCH)
-    expected = len(generate_running_stitch([(5, 25), (45, 25)], 3.0))
+    # The object's very first point is reached via JUMP only (needle moves
+    # there without stitching); every subsequent point becomes one STITCH,
+    # so the count is len(points) - 1, not len(points).
+    expected = len(generate_running_stitch([(5, 25), (45, 25)], 3.0)) - 1
     assert stitch_count == expected
 
     # bounds: centered design, 40mm line -> spans 20mm each side of x=0 roughly

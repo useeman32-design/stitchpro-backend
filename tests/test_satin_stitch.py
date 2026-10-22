@@ -187,7 +187,10 @@ def test_satin_to_dst_roundtrip():
     assert commands[-1] == END or END in commands
 
     stitch_count = sum(1 for c in commands if c == STITCH)
-    expected = len(generate_satin_stitch(geometry, density_mm=2.0))
+    # The object's very first point is reached via JUMP only (needle moves
+    # there without stitching); every subsequent point becomes one STITCH,
+    # so the count is len(points) - 1, not len(points).
+    expected = len(generate_satin_stitch(geometry, density_mm=2.0)) - 1
     assert stitch_count == expected
 
     min_x, min_y, max_x, max_y = pattern.bounds()

@@ -19,23 +19,43 @@ from pyembroidery import (
 )
 
 from digitizer.model import EmbroideryDesign
+from digitizer.stitches.fill.generator import generate_fill_stitch
 from digitizer.stitches.running.generator import generate_running_stitch
 from digitizer.stitches.satin.generator import generate_satin_stitch
 from formats.threads import hex_to_thread as _hex_to_thread
 
 
-def _object_stitch_points(obj) -> list[tuple[float, float]]:
+def _object_stitch_points(obj) -> list[tuple[float, float, bool]]:
     """Dispatch geometry -> physical stitch coordinates by object type.
-    RUNNING (Milestone 1) and SATIN (Milestone 2) are implemented; FILL
-    raises until its generator lands (Milestone 3)."""
+
+    Returns a list of (x_mm, y_mm, is_jump) triples: `is_jump=True` means
+    "lift the needle and jump here, starting a new disconnected stitch
+    run" -- always true for at least the very first point of every object.
+    RUNNING and SATIN each produce exactly one connected run (only their
+    first point is a jump); FILL can produce several disconnected runs per
+    object (concave polygons split a scan row into multiple spans) and
+    marks each run's own first point as a jump individually.
+
+    RUNNING (Milestone 1), SATIN (Milestone 2), and FILL (Milestone 3) are
+    all implemented."""
     from digitizer.model import ObjectType
 
     if obj.type == ObjectType.RUNNING:
-        return generate_running_stitch(obj.geometry, obj.stitch_settings.stitch_length_mm)
+        points = generate_running_stitch(obj.geometry, obj.stitch_settings.stitch_length_mm)
+        return [(x, y, i == 0) for i, (x, y) in enumerate(points)]
     if obj.type == ObjectType.SATIN:
-        return generate_satin_stitch(
+        points = generate_satin_stitch(
             obj.geometry,
             obj.stitch_settings.density_mm,
+            obj.stitch_settings.pull_compensation_mm,
+        )
+        return [(x, y, i == 0) for i, (x, y) in enumerate(points)]
+    if obj.type == ObjectType.FILL:
+        return generate_fill_stitch(
+            obj.geometry,
+            obj.stitch_settings.stitch_length_mm,
+            obj.stitch_settings.density_mm,
+            obj.stitch_settings.angle_deg,
             obj.stitch_settings.pull_compensation_mm,
         )
     raise NotImplementedError(f"Stitch generation for {obj.type} not implemented yet")
@@ -53,8 +73,8 @@ def compile_design(design: EmbroideryDesign) -> EmbPattern:
     current_color: str | None = None
 
     for obj in objects:
-        points = _object_stitch_points(obj)
-        if not points:
+        stitches = _object_stitch_points(obj)
+        if not stitches:
             continue
 
         if obj.color != current_color:
@@ -64,12 +84,9 @@ def compile_design(design: EmbroideryDesign) -> EmbPattern:
                 pattern.color_change(0, 0)
             current_color = obj.color
 
-        first_x, first_y = points[0]
-        pattern.add_stitch_absolute(
-            JUMP, (first_x + offset_x) * 10, (first_y + offset_y) * 10
-        )
-        for x, y in points:
-            pattern.add_stitch_absolute(STITCH, (x + offset_x) * 10, (y + offset_y) * 10)
+        for x, y, is_jump in stitches:
+            code = JUMP if is_jump else STITCH
+            pattern.add_stitch_absolute(code, (x + offset_x) * 10, (y + offset_y) * 10)
 
     pattern.add_command(END)
     return pattern
