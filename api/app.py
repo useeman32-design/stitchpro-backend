@@ -25,6 +25,14 @@ server-side digitizing milestones (satin, fill, real segmentation).
                                         returns a real file in any supported
                                         format. See request/response shape
                                         in the route's docstring below.
+  POST /api/design/image-to-file    -> Milestone 5: real server-side
+                                        digitizing. Takes a raw uploaded
+                                        image and runs the whole
+                                        segmentation -> objects -> stitches
+                                        -> file pipeline itself
+                                        (digitizer/pipeline.py), unlike the
+                                        two routes above which only compile
+                                        an already-digitized plan.
 """
 
 from __future__ import annotations
@@ -38,8 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flask import Flask, Response, jsonify, request, send_file
 
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
+from digitizer.pipeline import MAX_MAX_DIM, MIN_MAX_DIM, image_to_design
 from formats.dst.writer import design_to_dst_bytes
-from formats.writer import SUPPORTED_FORMATS, points_to_format_bytes
+from formats.writer import SUPPORTED_FORMATS, design_to_format_bytes, points_to_format_bytes
 
 app = Flask(__name__)
 
@@ -59,7 +68,7 @@ def _add_cors_headers(resp: Response) -> Response:
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "stitchpro-backend", "milestone": 4})
+    return jsonify({"status": "ok", "service": "stitchpro-backend", "milestone": 5})
 
 
 @app.get("/api/formats")
@@ -145,6 +154,92 @@ def points_to_file():
     try:
         file_bytes = points_to_format_bytes(raw_points, fmt, colors)
     except (ValueError, KeyError, TypeError) as e:
+        return jsonify({"error": str(e)}), 400
+
+    return send_file(
+        io.BytesIO(file_bytes),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=f"{safe_name}.{fmt}",
+    )
+
+
+@app.post("/api/design/image-to-file")
+def image_to_file():
+    """
+    Milestone 5: real server-side digitizing. Unlike /api/design/points-to-
+    file (which only compiles an already-digitized plan), this route does
+    the actual image -> segmentation -> embroidery objects work itself --
+    see digitizer/pipeline.py.
+
+    Multipart form-data request:
+      image           : required, the raw image file (PNG/JPEG/etc, whatever
+                         Pillow can decode).
+      width_mm        : required, target design width in mm.
+      height_mm       : required, target design height in mm.
+      format          : optional, one of SUPPORTED_FORMATS, default "dst".
+      max_colors      : optional int, 1-16, default 6 -- how many distinct
+                         thread colors to reduce the image to.
+      stitch_length_mm: optional float, default 3.0.
+      density_mm      : optional float, default 0.4 -- fill row spacing.
+      max_dim         : optional int, caps the longest image side (in
+                         pixels) actually processed, default 150 -- keeps
+                         server-side processing cheap regardless of the
+                         uploaded image's real resolution.
+      name            : optional, used for the download filename.
+
+    Returns the file as a binary attachment download on success, or
+    {"error": "..."} with a 400 status on a malformed request, an unreadable
+    image, or an image with no detectable foreground.
+    """
+    image_file = request.files.get("image")
+    if image_file is None or image_file.filename == "":
+        return jsonify({"error": "'image' file field is required"}), 400
+
+    form = request.form
+
+    def _float_field(key: str, default: float) -> float:
+        raw = form.get(key)
+        return default if raw in (None, "") else float(raw)
+
+    def _int_field(key: str, default: int) -> int:
+        raw = form.get(key)
+        return default if raw in (None, "") else int(raw)
+
+    try:
+        width_mm = _float_field("width_mm", 0)
+        height_mm = _float_field("height_mm", 0)
+        if width_mm <= 0 or height_mm <= 0:
+            return jsonify({"error": "'width_mm' and 'height_mm' are required and must be positive"}), 400
+
+        fmt = str(form.get("format", "dst")).lower()
+        if fmt not in SUPPORTED_FORMATS:
+            return jsonify({"error": f"unsupported format {fmt!r}", "supported": list(SUPPORTED_FORMATS)}), 400
+
+        max_colors = _int_field("max_colors", 6)
+        stitch_length_mm = _float_field("stitch_length_mm", 3.0)
+        density_mm = _float_field("density_mm", 0.4)
+        max_dim = _int_field("max_dim", 150)
+        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+            return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"invalid numeric field: {e}"}), 400
+
+    name = str(form.get("name") or "design")
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "design"
+
+    try:
+        design = image_to_design(
+            image_file.read(),
+            width_mm=width_mm,
+            height_mm=height_mm,
+            max_colors=max_colors,
+            stitch_length_mm=stitch_length_mm,
+            density_mm=density_mm,
+            max_dim=max_dim,
+        )
+        file_bytes = design_to_format_bytes(design, fmt)
+    except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
     return send_file(
