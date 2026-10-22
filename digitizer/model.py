@@ -19,6 +19,7 @@ class ObjectType(str, Enum):
     RUNNING = "RUNNING"
     SATIN = "SATIN"
     FILL = "FILL"
+    CROSS_STITCH = "CROSS_STITCH"
     # Reserved for later milestones (brief section 8): COLUMN, APPLIQUE, SPECIAL.
 
 
@@ -31,8 +32,10 @@ class StitchSettings:
 
     stitch_length_mm: float = 3.0       # RUNNING, and satin/fill row target length
     density_mm: float = 0.4             # SATIN: spacing between crossing stitches;
-                                         # FILL: spacing between rows
-    angle_deg: float = 0.0              # SATIN/FILL stitch direction
+                                         # FILL: spacing between rows;
+                                         # CROSS_STITCH: grid cell size (reused field,
+                                         # same "spacing between stitch events" idea)
+    angle_deg: float = 0.0              # SATIN/FILL/CROSS_STITCH stitch direction
     underlay: str | None = None         # None | "edge_run" | "center_run" | "zigzag"
     pull_compensation_mm: float = 0.0   # SATIN/FILL outward expansion
 

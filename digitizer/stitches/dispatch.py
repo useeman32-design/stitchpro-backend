@@ -10,6 +10,7 @@ sync about which generator handles which ObjectType.
 from __future__ import annotations
 
 from digitizer.model import EmbroideryObject, ObjectType
+from digitizer.stitches.cross.generator import generate_cross_stitch
 from digitizer.stitches.fill.generator import generate_fill_stitch
 from digitizer.stitches.running.generator import generate_running_stitch
 from digitizer.stitches.satin.generator import generate_satin_stitch
@@ -35,6 +36,15 @@ def _top_stitches(obj: EmbroideryObject) -> list[Stitch]:
         return generate_fill_stitch(
             obj.geometry,
             obj.stitch_settings.stitch_length_mm,
+            obj.stitch_settings.density_mm,
+            obj.stitch_settings.angle_deg,
+            obj.stitch_settings.pull_compensation_mm,
+        )
+    if obj.type == ObjectType.CROSS_STITCH:
+        # Same rings contract as FILL; `density_mm` is reused as the grid
+        # cell size (see digitizer/model.py's StitchSettings docstring).
+        return generate_cross_stitch(
+            obj.geometry,
             obj.stitch_settings.density_mm,
             obj.stitch_settings.angle_deg,
             obj.stitch_settings.pull_compensation_mm,

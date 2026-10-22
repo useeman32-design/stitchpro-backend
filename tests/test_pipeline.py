@@ -88,3 +88,57 @@ class TestImageToDesign:
         data = design_to_format_bytes(design, "dst")
         pattern = read_dst(io.BytesIO(data))
         assert len(pattern.stitches) > 0
+
+    def test_cross_stitch_style_produces_cross_stitch_objects(self):
+        design = image_to_design(
+            _two_color_png(), width_mm=50, height_mm=50, max_colors=4, stitch_style="cross"
+        )
+        assert len(design.objects) == 2
+        assert all(o.type == ObjectType.CROSS_STITCH for o in design.objects)
+        pattern = compile_design(design)
+        assert len(pattern.stitches) > 0
+
+    def test_unknown_stitch_style_raises(self):
+        with pytest.raises(ValueError):
+            image_to_design(_two_color_png(), width_mm=30, height_mm=30, stitch_style="zigzag")
+
+    def test_density_none_picks_a_style_appropriate_default(self):
+        fill_design = image_to_design(_two_color_png(), width_mm=30, height_mm=30, stitch_style="fill")
+        cross_design = image_to_design(_two_color_png(), width_mm=30, height_mm=30, stitch_style="cross")
+        assert fill_design.objects[0].stitch_settings.density_mm == pytest.approx(0.4)
+        assert cross_design.objects[0].stitch_settings.density_mm == pytest.approx(1.8)
+
+    def test_explicit_density_overrides_the_style_default(self):
+        design = image_to_design(
+            _two_color_png(), width_mm=30, height_mm=30, stitch_style="cross", density_mm=3.0
+        )
+        assert design.objects[0].stitch_settings.density_mm == pytest.approx(3.0)
+
+    def test_downscaled_solid_circle_does_not_fragment_into_multiple_objects(self):
+        # End-to-end regression test for the combination of fixes that
+        # together solve the user-reported "fill isn't solid" symptom:
+        # LANCZOS downscaling (pipeline.py's load_and_downscale, triggered
+        # here by using a large source image against the default max_dim)
+        # creates a thin anti-aliased blend ring around any solid-color
+        # shape's edge. Without _merge_near_duplicate_colors (color_
+        # quantize.py) and the min_bbox_mm thin-sliver filter (polygons.py)
+        # working together, that ring could show up as its own small
+        # "object" or two near-identical "colors" splitting what should be
+        # one clean fill region -- exactly what a real user's logo photo
+        # hits. A single solid-colored circle must always come back as
+        # exactly one FILL object.
+        img = Image.new("RGB", (300, 300), (255, 255, 255))
+        d = ImageDraw.Draw(img)
+        d.ellipse([50, 50, 250, 250], fill=(20, 60, 160))
+        design = image_to_design(_png_bytes(img), width_mm=50, height_mm=50, max_colors=4)
+        assert len(design.objects) == 1
+
+    def test_smooth_curves_false_skips_smoothing(self):
+        # Both should still produce valid, stitchable designs either way --
+        # this just confirms the flag is actually wired through, not that
+        # one specific smoothing outcome is "correct" (that's smoothing.py's
+        # own test module's job).
+        smoothed = image_to_design(_letter_o_png(), width_mm=40, height_mm=40, smooth_curves=True)
+        unsmoothed = image_to_design(_letter_o_png(), width_mm=40, height_mm=40, smooth_curves=False)
+        assert len(smoothed.objects) == 1
+        assert len(unsmoothed.objects) == 1

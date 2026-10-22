@@ -47,6 +47,65 @@ class TestBuildLabelGrid:
         # bottom-left corner, far from the stripe, must read as background
         assert grid[39][0] == BACKGROUND_LABEL
 
+    def test_two_distinct_colors_survive_anti_aliased_downscale(self):
+        # Regression test: a large image with two clearly distinct
+        # foreground colors, downscaled with LANCZOS (the same resample
+        # pipeline.py's load_and_downscale uses), produces a halo of
+        # subtly-different near-white anti-aliased edge pixels. With a
+        # small max_colors budget, MEDIANCUT used to waste palette slots
+        # splitting that halo and collapse both real foreground colors into
+        # a single muddy average bucket. Both colors must survive.
+        big = Image.new("RGB", (300, 300), (255, 255, 255))
+        navy = (58, 49, 120)
+        gold = (212, 170, 80)
+        for y in range(40, 140):
+            for x in range(40, 260):
+                big.putpixel((x, y), navy)
+        for y in range(160, 260):
+            for x in range(40, 260):
+                big.putpixel((x, y), gold)
+        small = big.resize((60, 60), Image.LANCZOS)
+
+        palette, grid = build_label_grid(small, max_colors=4)
+        used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
+        used_colors = {palette[i] for i in used_labels}
+
+        def _closest(target):
+            return min(
+                used_colors,
+                key=lambda h: sum(
+                    (a - b) ** 2
+                    for a, b in zip(
+                        (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)), target
+                    )
+                ),
+            )
+
+        assert len(used_colors) >= 2
+        navy_match = _closest(navy)
+        gold_match = _closest(gold)
+        assert navy_match != gold_match
+
+    def test_exact_duplicate_quantize_colors_are_merged_into_one_label(self):
+        # Directly exercises _merge_near_duplicate_colors's actual target:
+        # two near-identical (not just "somewhat close") colors that
+        # MEDIANCUT can allocate separate palette slots for even though
+        # they're visually the same thread color. The broader "one solid
+        # shape doesn't fragment into multiple *geometric* objects" claim
+        # (which also depends on a genuinely-different blend-ring color
+        # being filtered out as a thin sliver, a job for
+        # label_grid_to_ring_groups's `min_bbox_mm`, not this function) is
+        # covered end-to-end in test_pipeline.py.
+        img = Image.new("RGB", (20, 20), (255, 255, 255))
+        for y in range(5, 15):
+            for x in range(5, 10):
+                img.putpixel((x, y), (20, 60, 160))
+            for x in range(10, 15):
+                img.putpixel((x, y), (21, 61, 161))  # 1 unit off, same thread in practice
+        palette, grid = build_label_grid(img, max_colors=4)
+        used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
+        assert len(used_labels) == 1
+
 
 class TestLabelGridToRingGroups:
     def _square_grid(self, w, h, label, x0, y0, x1, y1):
@@ -94,6 +153,29 @@ class TestLabelGridToRingGroups:
     def test_no_pixels_of_label_returns_empty(self):
         grid = [[BACKGROUND_LABEL] * 10 for _ in range(10)]
         assert label_grid_to_ring_groups(grid, 0, 1.0, 1.0) == []
+
+    def test_thin_long_sliver_below_min_bbox_mm_is_discarded(self):
+        # Regression test: a one-pixel-wide but many-pixels-long sliver
+        # (the shape left behind by an anti-aliased-edge pixel band that
+        # ended up in its own color bucket -- see color_quantize.py's
+        # _merge_near_duplicate_colors module docstring) has plenty of
+        # pixel-space *area* to survive `min_area_px`, but is still just a
+        # hairline streak that was never a real, stitchable design feature.
+        # At 0.1mm/px, a 1x20px sliver is 0.1mm x 2.0mm -- its shorter side
+        # must trip `min_bbox_mm`'s default (0.6mm).
+        grid = [[BACKGROUND_LABEL] * 25 for _ in range(25)]
+        for y in range(2, 22):
+            grid[y][10] = 0  # 1px wide, 20px long vertical sliver
+        groups = label_grid_to_ring_groups(grid, 0, 0.1, 0.1, min_area_px=0.5)
+        assert groups == []
+
+    def test_small_round_dot_above_min_bbox_mm_survives(self):
+        # A genuinely small but roughly square/round design detail (e.g. a
+        # letter's dot) should NOT be swept up by the same filter -- only
+        # long, hair-thin slivers are the target.
+        grid = self._square_grid(20, 20, 0, 8, 8, 12, 12)  # 4x4px square
+        groups = label_grid_to_ring_groups(grid, 0, 1.0, 1.0)  # 4mm x 4mm
+        assert len(groups) == 1
 
     def test_coordinates_scaled_to_mm(self):
         grid = self._square_grid(20, 20, 0, 0, 0, 10, 10)

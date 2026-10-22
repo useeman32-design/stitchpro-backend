@@ -46,7 +46,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flask import Flask, Response, jsonify, request, send_file
 
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
-from digitizer.pipeline import MAX_MAX_DIM, MIN_MAX_DIM, image_to_design
+from digitizer.pipeline import MAX_MAX_DIM, MIN_MAX_DIM, STITCH_STYLES, image_to_design
+from digitizer.points_export import design_to_points
 from formats.dst.writer import design_to_dst_bytes
 from formats.writer import SUPPORTED_FORMATS, design_to_format_bytes, points_to_format_bytes
 
@@ -164,6 +165,73 @@ def points_to_file():
     )
 
 
+def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | None]:
+    """Shared request parsing + digitizing for both image-to-file and
+    image-to-points: validates the multipart form, runs `image_to_design`,
+    and returns either `(design, None)` on success or `(None, (response,
+    status))` on any validation/digitizing failure -- callers just need to
+    `return err` when `err is not None`."""
+    image_file = request.files.get("image")
+    if image_file is None or image_file.filename == "":
+        return None, (jsonify({"error": "'image' file field is required"}), 400)
+
+    form = request.form
+
+    def _float_field(key: str, default: float) -> float:
+        raw = form.get(key)
+        return default if raw in (None, "") else float(raw)
+
+    def _optional_float_field(key: str) -> float | None:
+        raw = form.get(key)
+        return None if raw in (None, "") else float(raw)
+
+    def _int_field(key: str, default: int) -> int:
+        raw = form.get(key)
+        return default if raw in (None, "") else int(raw)
+
+    def _bool_field(key: str, default: bool) -> bool:
+        raw = form.get(key)
+        return default if raw in (None, "") else str(raw).strip().lower() not in ("0", "false", "no")
+
+    try:
+        width_mm = _float_field("width_mm", 0)
+        height_mm = _float_field("height_mm", 0)
+        if width_mm <= 0 or height_mm <= 0:
+            return None, (jsonify({"error": "'width_mm' and 'height_mm' are required and must be positive"}), 400)
+
+        max_colors = _int_field("max_colors", 6)
+        stitch_length_mm = _float_field("stitch_length_mm", 3.0)
+        density_mm = _optional_float_field("density_mm")
+        angle_deg = _float_field("angle_deg", 0.0)
+        max_dim = _int_field("max_dim", 150)
+        smooth_curves = _bool_field("smooth_curves", True)
+        stitch_style = str(form.get("stitch_style") or "fill").strip().lower()
+        if stitch_style not in STITCH_STYLES:
+            return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
+        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+            return None, (jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400)
+    except (TypeError, ValueError) as e:
+        return None, (jsonify({"error": f"invalid numeric field: {e}"}), 400)
+
+    try:
+        design = image_to_design(
+            image_file.read(),
+            width_mm=width_mm,
+            height_mm=height_mm,
+            max_colors=max_colors,
+            stitch_length_mm=stitch_length_mm,
+            density_mm=density_mm,
+            max_dim=max_dim,
+            angle_deg=angle_deg,
+            stitch_style=stitch_style,
+            smooth_curves=smooth_curves,
+        )
+    except ValueError as e:
+        return None, (jsonify({"error": str(e)}), 400)
+
+    return design, None
+
+
 @app.post("/api/design/image-to-file")
 def image_to_file():
     """
@@ -181,7 +249,24 @@ def image_to_file():
       max_colors      : optional int, 1-16, default 6 -- how many distinct
                          thread colors to reduce the image to.
       stitch_length_mm: optional float, default 3.0.
-      density_mm      : optional float, default 0.4 -- fill row spacing.
+      density_mm      : optional float -- FILL row spacing, or CROSS_STITCH
+                         grid cell size (see `stitch_style`). Defaults to a
+                         sensible value for whichever style is selected
+                         (0.4mm fill rows, 1.8mm cross-stitch cells) if
+                         omitted.
+      angle_deg       : optional float, default 0.0 -- stitch direction for
+                         FILL rows / CROSS_STITCH grid alignment.
+      stitch_style    : optional, "fill" (default, tatami rows -- best for
+                         solid-color logos/graphics) or "cross" (a grid of
+                         X's -- better for a deliberately pixelated/sampler-
+                         style design). Applies to every detected region in
+                         the design.
+      smooth_curves   : optional bool, default true -- adaptive corner-
+                         preserving curve smoothing on detected region
+                         boundaries (digitizer/geometry/smoothing.py).
+                         Sharp corners are always preserved either way; set
+                         to false only to get the raw simplified-polygon
+                         boundary.
       max_dim         : optional int, caps the longest image side (in
                          pixels) actually processed, default 150 -- keeps
                          server-side processing cheap regardless of the
@@ -192,52 +277,18 @@ def image_to_file():
     {"error": "..."} with a 400 status on a malformed request, an unreadable
     image, or an image with no detectable foreground.
     """
-    image_file = request.files.get("image")
-    if image_file is None or image_file.filename == "":
-        return jsonify({"error": "'image' file field is required"}), 400
+    fmt = str(request.form.get("format", "dst")).lower()
+    if fmt not in SUPPORTED_FORMATS:
+        return jsonify({"error": f"unsupported format {fmt!r}", "supported": list(SUPPORTED_FORMATS)}), 400
 
-    form = request.form
+    design, err = _digitize_image_from_request()
+    if err is not None:
+        return err
 
-    def _float_field(key: str, default: float) -> float:
-        raw = form.get(key)
-        return default if raw in (None, "") else float(raw)
-
-    def _int_field(key: str, default: int) -> int:
-        raw = form.get(key)
-        return default if raw in (None, "") else int(raw)
-
-    try:
-        width_mm = _float_field("width_mm", 0)
-        height_mm = _float_field("height_mm", 0)
-        if width_mm <= 0 or height_mm <= 0:
-            return jsonify({"error": "'width_mm' and 'height_mm' are required and must be positive"}), 400
-
-        fmt = str(form.get("format", "dst")).lower()
-        if fmt not in SUPPORTED_FORMATS:
-            return jsonify({"error": f"unsupported format {fmt!r}", "supported": list(SUPPORTED_FORMATS)}), 400
-
-        max_colors = _int_field("max_colors", 6)
-        stitch_length_mm = _float_field("stitch_length_mm", 3.0)
-        density_mm = _float_field("density_mm", 0.4)
-        max_dim = _int_field("max_dim", 150)
-        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
-            return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
-    except (TypeError, ValueError) as e:
-        return jsonify({"error": f"invalid numeric field: {e}"}), 400
-
-    name = str(form.get("name") or "design")
+    name = str(request.form.get("name") or "design")
     safe_name = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "design"
 
     try:
-        design = image_to_design(
-            image_file.read(),
-            width_mm=width_mm,
-            height_mm=height_mm,
-            max_colors=max_colors,
-            stitch_length_mm=stitch_length_mm,
-            density_mm=density_mm,
-            max_dim=max_dim,
-        )
         file_bytes = design_to_format_bytes(design, fmt)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -248,6 +299,45 @@ def image_to_file():
         as_attachment=True,
         download_name=f"{safe_name}.{fmt}",
     )
+
+
+@app.post("/api/design/image-to-points")
+def image_to_points():
+    """
+    Same digitizing pipeline as /api/design/image-to-file (Milestone 5), but
+    returns the plain JSON point-stream contract
+    (digitizer/points_export.py) instead of a binary file -- meant for
+    client-side *preview rendering* (e.g. stitch-pro's Simulator screen),
+    not for machine output. This lets any client (web or native -- neither
+    needs a server-specific renderer) draw the exact same real,
+    server-digitized stitch plan with its own renderer, using the identical
+    {x, y, command} point contract the frontend already speaks for its own
+    client-side-generated plans (see stitch-pro's src/utils/dstWriter.ts).
+
+    Multipart form-data request: same fields as /api/design/image-to-file
+    (image, width_mm, height_mm, max_colors, stitch_length_mm, density_mm,
+    angle_deg, stitch_style, smooth_curves, max_dim), except there is no
+    `format`/`name` field -- those only make sense for a file download.
+
+    Response JSON on success:
+      {"width_mm": ..., "height_mm": ...,
+       "threads": ["#RRGGBB", ...],
+       "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
+                   "command": "jump"|"stitch"|"colorChange"}, ...]}
+
+    Or {"error": "..."} with a 400 status on a malformed request, an
+    unreadable image, or an image with no detectable foreground.
+    """
+    design, err = _digitize_image_from_request()
+    if err is not None:
+        return err
+
+    try:
+        result = design_to_points(design)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify(result)
 
 
 if __name__ == "__main__":

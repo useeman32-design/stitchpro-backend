@@ -8,6 +8,13 @@ grid saying which palette color (or "background") each pixel belongs to.
 Everything downstream (digitizer/segmentation/polygons.py) works off that
 label grid, not the raw image.
 
+Background/material detection itself lives in
+digitizer/segmentation/background_removal.py (a border-connected flood fill,
+robust to a real photographed garment's lighting/shading -- see that
+module's docstring for why a flood fill, not a single global color
+distance, is required for the "snap a photo of a design on a real shirt"
+use case) -- this module just quantizes whatever that leaves as foreground.
+
 Deliberately uses only Pillow (already a dependency) -- no OpenCV/
 scikit-image, matching the conservative dependency stance from
 docs/embroidery-engine-research.md until the cPanel-vs-VPS hosting question
@@ -17,64 +24,79 @@ ask for shared hosting than Pillow).
 
 from __future__ import annotations
 
-import math
-
 from PIL import Image
+
+from digitizer.segmentation.background_removal import compute_background_mask
 
 BACKGROUND_LABEL = -1
 
 Rgb = tuple[int, int, int]
 
 
-def _hex_to_rgb(h: str) -> Rgb:
-    h = h.lstrip("#")
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+def _dist2(a: Rgb, b: Rgb) -> int:
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
 
 
-def _dist(a: Rgb, b: Rgb) -> float:
-    return math.sqrt(sum((ac - bc) ** 2 for ac, bc in zip(a, b)))
+def _merge_near_duplicate_colors(
+    palette_rgb: list[Rgb], merge_tolerance: float
+) -> tuple[list[Rgb], list[int]]:
+    """Median-cut quantization can split what should be one solid color
+    into two (or more) near-identical palette entries -- a real, observed
+    case: a clean solid-blue logo badge photographed/exported with
+    anti-aliased edges comes out with its interior blue plus a handful of
+    edge-blend pixels, and `Image.quantize()` sometimes allocates a
+    *second*, barely-different blue swatch to the mix rather than lumping
+    them together. Left alone, this is exactly what produces the "fill
+    isn't solid" symptom: two "different" thread colors, each only getting
+    part of the shape, with a visible gap/seam between them instead of one
+    clean fill.
 
+    This greedily unions any two palette entries within `merge_tolerance`
+    of each other (transitively, via a small union-find) and returns the
+    deduplicated palette plus an `old_index -> new_index` remap list.
+    """
+    n = len(palette_rgb)
+    parent = list(range(n))
 
-def _detect_background_rgb(rgba: Image.Image) -> Rgb:
-    """Find the dominant flat background color by sampling the whole image
-    border (not just the 4 corner pixels -- a single stripe or shape that
-    happens to touch one corner would otherwise throw the whole detection
-    off) and taking the average of whichever color cluster covers the most
-    of that perimeter. Real digitizing artwork (a logo/graphic on a plain
-    surrounding color, per this pipeline's intended use -- see
-    digitizer/pipeline.py) has its background covering most of the border
-    even if a shape happens to touch one edge or corner."""
-    w, h = rgba.size
-    px = rgba.load()
-    border: list[Rgb] = []
-    for x in range(w):
-        border.append(px[x, 0][:3])
-        border.append(px[x, h - 1][:3])
-    for y in range(h):
-        border.append(px[0, y][:3])
-        border.append(px[w - 1, y][:3])
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
 
-    clusters: list[list[Rgb]] = []
-    for c in border:
-        for cluster in clusters:
-            if _dist(c, cluster[0]) < 20:
-                cluster.append(c)
-                break
-        else:
-            clusters.append([c])
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
 
-    largest = max(clusters, key=len)
-    r = sum(c[0] for c in largest) // len(largest)
-    g = sum(c[1] for c in largest) // len(largest)
-    b = sum(c[2] for c in largest) // len(largest)
-    return (r, g, b)
+    tol2 = merge_tolerance * merge_tolerance
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _dist2(palette_rgb[i], palette_rgb[j]) <= tol2:
+                union(i, j)
+
+    root_to_new: dict[int, int] = {}
+    new_palette: list[Rgb] = []
+    remap = [0] * n
+    for i in range(n):
+        root = find(i)
+        if root not in root_to_new:
+            # `root` is itself a valid palette index (union-find roots are
+            # drawn from the same 0..n-1 index space), so its own color is
+            # a perfectly good, deterministic representative for the group
+            # -- no need to search for one.
+            root_to_new[root] = len(new_palette)
+            new_palette.append(palette_rgb[root])
+        remap[i] = root_to_new[root]
+    return new_palette, remap
 
 
 def build_label_grid(
     img: Image.Image,
     max_colors: int = 6,
     alpha_threshold: int = 16,
-    bg_tolerance: float = 24.0,
+    bg_step_tolerance: float = 30.0,
+    color_merge_tolerance: float = 18.0,
 ) -> tuple[list[str], list[list[int]]]:
     """Reduce `img` (any PIL mode, already downscaled by the caller) to at
     most `max_colors` hex colors plus a label grid.
@@ -82,44 +104,56 @@ def build_label_grid(
     Returns `(palette_hex, label_grid)`:
       - `palette_hex[i]` is the hex color for label `i`.
       - `label_grid[y][x]` is either an index into `palette_hex`, or
-        `BACKGROUND_LABEL` for a pixel that is transparent (alpha below
-        `alpha_threshold`) or close to the detected flat background color
-        (within `bg_tolerance` in RGB Euclidean distance).
+        `BACKGROUND_LABEL` for a pixel the border-connected flood fill
+        (see background_removal.py) classified as background/surrounding
+        material, transparent, or part of a small region the closing pass
+        folded back into the background.
 
-    A pixel's own quantized color is used if neither background condition
-    applies, even if that quantized bucket is the one closest to the overall
-    background color elsewhere in the image -- only pixels *individually*
-    close to the background are excluded, which correctly keeps a shape
-    whose fill color happens to be similar to (but distinct from) the
-    background, while still dropping true background/anti-aliased-edge
-    pixels in the halo around real shapes.
+    Only genuine foreground pixels -- the ones the flood fill couldn't
+    reach from any image border or transparent region through a chain of
+    small local color steps -- compete for palette slots, so a design's
+    real colors are never diluted by a shirt's lighting gradient or a
+    photo's compression noise around its edges.
     """
     rgba = img.convert("RGBA")
     w, h = rgba.size
-    bg_rgb = _detect_background_rgb(rgba)
-
-    # Image.quantize() needs an RGB/P source; flatten onto white first for
-    # quantization purposes only (true transparency is handled separately
-    # below via the alpha channel, not lost here).
-    rgb_flat = Image.new("RGB", (w, h), (255, 255, 255))
-    rgb_flat.paste(rgba, mask=rgba.split()[3])
-    quantized = rgb_flat.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
-    q_palette = quantized.getpalette() or []
-    q_pixels = quantized.load()
     rgba_pixels = rgba.load()
 
-    n_colors = min(max_colors, len(q_palette) // 3)
-    palette_hex = [
-        "#%02x%02x%02x" % tuple(q_palette[i * 3 : i * 3 + 3]) for i in range(n_colors)
-    ]
+    bg_mask = compute_background_mask(rgba, alpha_threshold=alpha_threshold, step_tolerance=bg_step_tolerance)
 
-    label_grid: list[list[int]] = [[0] * w for _ in range(h)]
+    fg_coords: list[tuple[int, int]] = []
+    fg_colors: list[Rgb] = []
     for y in range(h):
         for x in range(w):
+            if bg_mask[y][x]:
+                continue
             r, g, b, a = rgba_pixels[x, y]
-            if a < alpha_threshold or _dist((r, g, b), bg_rgb) < bg_tolerance:
-                label_grid[y][x] = BACKGROUND_LABEL
-            else:
-                label_grid[y][x] = q_pixels[x, y]
+            if a < alpha_threshold:
+                continue
+            fg_coords.append((x, y))
+            fg_colors.append((r, g, b))
+
+    label_grid: list[list[int]] = [[BACKGROUND_LABEL] * w for _ in range(h)]
+    if not fg_colors:
+        return [], label_grid
+
+    # Quantize just the foreground pixels, packed into a 1-D strip image --
+    # Image.quantize() needs an image, but the 2-D layout doesn't matter for
+    # palette generation, only the multiset of colors does.
+    fg_strip = Image.new("RGB", (len(fg_colors), 1))
+    fg_strip.putdata(fg_colors)
+    quantized = fg_strip.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
+    q_palette = quantized.getpalette() or []
+    q_pixels = quantized.load()
+
+    n_colors = min(max_colors, len(q_palette) // 3)
+    palette_rgb = [tuple(q_palette[i * 3 : i * 3 + 3]) for i in range(n_colors)]
+
+    merged_palette_rgb, remap = _merge_near_duplicate_colors(palette_rgb, color_merge_tolerance)
+    palette_hex = ["#%02x%02x%02x" % color for color in merged_palette_rgb]
+
+    for i, (x, y) in enumerate(fg_coords):
+        label_grid[y][x] = remap[q_pixels[i, 0]]
 
     return palette_hex, label_grid
+
