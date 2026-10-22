@@ -59,7 +59,7 @@ def _add_cors_headers(resp: Response) -> Response:
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "stitchpro-backend", "milestone": 3})
+    return jsonify({"status": "ok", "service": "stitchpro-backend", "milestone": 4})
 
 
 @app.get("/api/formats")

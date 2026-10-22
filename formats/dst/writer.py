@@ -19,61 +19,30 @@ from pyembroidery import (
 )
 
 from digitizer.model import EmbroideryDesign
-from digitizer.stitches.fill.generator import generate_fill_stitch
-from digitizer.stitches.running.generator import generate_running_stitch
-from digitizer.stitches.satin.generator import generate_satin_stitch
+from digitizer.routing.router import route_objects
+from digitizer.stitches.dispatch import generate_object_stitches
 from formats.threads import hex_to_thread as _hex_to_thread
-
-
-def _object_stitch_points(obj) -> list[tuple[float, float, bool]]:
-    """Dispatch geometry -> physical stitch coordinates by object type.
-
-    Returns a list of (x_mm, y_mm, is_jump) triples: `is_jump=True` means
-    "lift the needle and jump here, starting a new disconnected stitch
-    run" -- always true for at least the very first point of every object.
-    RUNNING and SATIN each produce exactly one connected run (only their
-    first point is a jump); FILL can produce several disconnected runs per
-    object (concave polygons split a scan row into multiple spans) and
-    marks each run's own first point as a jump individually.
-
-    RUNNING (Milestone 1), SATIN (Milestone 2), and FILL (Milestone 3) are
-    all implemented."""
-    from digitizer.model import ObjectType
-
-    if obj.type == ObjectType.RUNNING:
-        points = generate_running_stitch(obj.geometry, obj.stitch_settings.stitch_length_mm)
-        return [(x, y, i == 0) for i, (x, y) in enumerate(points)]
-    if obj.type == ObjectType.SATIN:
-        points = generate_satin_stitch(
-            obj.geometry,
-            obj.stitch_settings.density_mm,
-            obj.stitch_settings.pull_compensation_mm,
-        )
-        return [(x, y, i == 0) for i, (x, y) in enumerate(points)]
-    if obj.type == ObjectType.FILL:
-        return generate_fill_stitch(
-            obj.geometry,
-            obj.stitch_settings.stitch_length_mm,
-            obj.stitch_settings.density_mm,
-            obj.stitch_settings.angle_deg,
-            obj.stitch_settings.pull_compensation_mm,
-        )
-    raise NotImplementedError(f"Stitch generation for {obj.type} not implemented yet")
 
 
 def compile_design(design: EmbroideryDesign) -> EmbPattern:
     """Convert our internal EmbroideryDesign into a pyembroidery EmbPattern,
-    in mm -> 0.1mm units, centered at the DST origin (0,0)."""
+    in mm -> 0.1mm units, centered at the DST origin (0,0).
+
+    Stitch order is decided by `route_objects` (Milestone 4), not by the
+    design's raw object list order -- it enforces the layer constraint,
+    groups same-color objects into contiguous runs to minimize color
+    changes/trims, and applies a basic nearest-neighbor pass to cut down
+    travel distance within each color group."""
     pattern = EmbPattern()
 
     offset_x = -design.width_mm / 2
     offset_y = -design.height_mm / 2
 
-    objects = design.ordered_objects()
+    objects = route_objects(design.objects)
     current_color: str | None = None
 
     for obj in objects:
-        stitches = _object_stitch_points(obj)
+        stitches = generate_object_stitches(obj)
         if not stitches:
             continue
 

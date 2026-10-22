@@ -45,6 +45,11 @@ class EmbroideryObject:
     color: str                          # hex, e.g. "#111111"
     stitch_settings: StitchSettings = field(default_factory=StitchSettings)
     sequence: int = 0                   # stitch-out order; routing.py may reassign this
+    layer: int = 0                      # hard stitch-order constraint: every object in a
+                                         # lower layer stitches fully before any object in a
+                                         # higher layer (e.g. underlay=0 before satin/fill=1
+                                         # on top of it). routing.py never reorders across
+                                         # layers, only within one.
 
 
 @dataclass
