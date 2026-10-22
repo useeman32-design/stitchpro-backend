@@ -116,15 +116,26 @@ def _subdivide_span(
 
 
 def generate_fill_stitch(
-    polygon_points: list[Point],
+    rings: list[list[Point]],
     stitch_length_mm: float = 3.0,
     density_mm: float = 0.4,
     angle_deg: float = 0.0,
     pull_compensation_mm: float = 0.0,
 ) -> list[Stitch]:
     """
-    Convert a simple (non-self-intersecting) polygon into tatami fill
-    stitches.
+    Convert a polygon-with-holes into tatami fill stitches.
+
+    `rings[0]` is the outer boundary; `rings[1:]` (zero or more) are holes
+    cut out of it -- the standard shell/holes polygon representation, same
+    as Shapely's own `Polygon(shell, holes)` constructor, which this
+    function hands them to directly. Holes are essential for real letterform
+    and logo fills: any shape with an enclosed counter (O, A, B, D, P, Q, R,
+    8, @, a donut logo, ...) needs the hole excluded from stitching, not
+    just left as a visual gap that the scanline happens to skip -- Shapely's
+    polygon-with-holes handles arbitrarily shaped/positioned holes exactly,
+    including holes that only affect some rows (a concave outer boundary
+    combined with holes can still produce several spans per row; see
+    `_extract_spans`).
 
     Guarantees:
     - Rows run parallel to `angle_deg` (0 = horizontal), spaced `density_mm`
@@ -133,9 +144,9 @@ def generate_fill_stitch(
       every resulting stitch back by `+angle_deg` at the end. Much simpler
       and more robust than trying to scan along an arbitrary angle directly.
     - Each row is split into one or more spans by intersecting it with the
-      polygon -- a concave polygon can produce multiple disjoint spans per
-      row, each becoming its own disconnected stitch run (`is_jump=True` at
-      its first point).
+      polygon-with-holes -- a concave outer boundary and/or a hole can
+      produce multiple disjoint spans per row, each becoming its own
+      disconnected stitch run (`is_jump=True` at its first point).
     - No single stitch within a span exceeds `stitch_length_mm`; both
       endpoints of every span are always exact stitch points.
     - Alternating rows are stitched in opposite directions (boustrophedon /
@@ -143,25 +154,32 @@ def generate_fill_stitch(
       alternating rows' interior stitches are phase-shifted by half a
       stitch length to avoid a visible straight "valley" seam running
       across the rows.
-    - `pull_compensation_mm` expands the fill area outward (a uniform
-      polygon buffer) before scanning, so the finished (pulled-in)
-      embroidery comes out closer to the intended size.
+    - `pull_compensation_mm` expands the outer boundary and shrinks each
+      hole outward/inward respectively (a uniform polygon buffer, which
+      Shapely applies correctly to both the shell and the holes at once),
+      so the finished (pulled-in) embroidery comes out closer to the
+      intended size without the holes closing up.
     """
     if stitch_length_mm <= 0:
         raise ValueError("stitch_length_mm must be > 0")
     if density_mm <= 0:
         raise ValueError("density_mm must be > 0")
-    if len(polygon_points) < 3:
-        raise ValueError("polygon must have at least 3 points")
+    if not rings:
+        raise ValueError("rings must contain at least an outer boundary")
+    for ring in rings:
+        if len(ring) < 3:
+            raise ValueError("every ring must have at least 3 points")
 
-    polygon = Polygon(polygon_points)
+    polygon = Polygon(shell=rings[0], holes=rings[1:])
     if not polygon.is_valid:
         polygon = polygon.buffer(0)  # standard Shapely fix for minor ring issues
     if polygon.is_empty or polygon.area < 1e-9:
-        raise ValueError("polygon is degenerate (zero area)")
+        raise ValueError("polygon is degenerate (zero area, or holes fully cover the outer boundary)")
 
     if pull_compensation_mm:
         polygon = polygon.buffer(pull_compensation_mm, join_style=2)
+        if polygon.is_empty or polygon.area < 1e-9:
+            raise ValueError("pull_compensation_mm made the polygon degenerate (holes likely closed up)")
 
     pivot = polygon.centroid
     working = rotate(polygon, -angle_deg, origin=pivot, use_radians=False)

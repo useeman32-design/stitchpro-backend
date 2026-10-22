@@ -207,7 +207,7 @@ def test_all_three_stitch_types_with_routing():
         objects=[
             EmbroideryObject(
                 id="body", type=ObjectType.FILL,
-                geometry=[(0, 12), (20, 12), (20, 22), (0, 22)],
+                geometry=[[(0, 12), (20, 12), (20, 22), (0, 22)]],
                 color="#2E8B57", stitch_settings=StitchSettings(stitch_length_mm=3.0, density_mm=2.0),
                 sequence=0, layer=0,
             ),

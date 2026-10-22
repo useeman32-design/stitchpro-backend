@@ -34,7 +34,7 @@ def dist(a, b):
 def test_rectangle_row_count():
     # 20mm wide, 10mm tall rectangle, rows every 2mm -> ~5 rows
     rect = [(0, 0), (20, 0), (20, 10), (0, 10)]
-    stitches = generate_fill_stitch(rect, stitch_length_mm=3.0, density_mm=2.0)
+    stitches = generate_fill_stitch([rect], stitch_length_mm=3.0, density_mm=2.0)
     assert stitches, "expected at least some stitches"
 
     jump_indices = [i for i, (_, _, is_jump) in enumerate(stitches) if is_jump]
@@ -44,7 +44,7 @@ def test_rectangle_row_count():
 
 def test_rectangle_spans_cover_full_width():
     rect = [(0, 0), (20, 0), (20, 10), (0, 10)]
-    stitches = generate_fill_stitch(rect, stitch_length_mm=2.0, density_mm=3.0)
+    stitches = generate_fill_stitch([rect], stitch_length_mm=2.0, density_mm=3.0)
     xs = [x for x, _, _ in stitches]
     assert min(xs) >= -1e-6
     assert max(xs) <= 20 + 1e-6
@@ -56,7 +56,7 @@ def test_rectangle_spans_cover_full_width():
 def test_rectangle_stitch_length_bounded_within_runs():
     rect = [(0, 0), (20, 0), (20, 10), (0, 10)]
     stitch_length = 2.5
-    stitches = generate_fill_stitch(rect, stitch_length_mm=stitch_length, density_mm=3.0)
+    stitches = generate_fill_stitch([rect], stitch_length_mm=stitch_length, density_mm=3.0)
 
     for i in range(1, len(stitches)):
         x0, y0, is_jump = stitches[i]
@@ -68,7 +68,7 @@ def test_rectangle_stitch_length_bounded_within_runs():
 
 def test_rows_alternate_direction():
     rect = [(0, 0), (20, 0), (20, 10), (0, 10)]
-    stitches = generate_fill_stitch(rect, stitch_length_mm=3.0, density_mm=2.0)
+    stitches = generate_fill_stitch([rect], stitch_length_mm=3.0, density_mm=2.0)
 
     jump_positions = [(x, y) for x, y, is_jump in stitches if is_jump]
     assert len(jump_positions) >= 2
@@ -89,7 +89,7 @@ def test_concave_u_shape_produces_multiple_spans_on_notched_rows():
     u_shape = [
         (0, 0), (30, 0), (30, 20), (20, 20), (20, 8), (10, 8), (10, 20), (0, 20),
     ]
-    stitches = generate_fill_stitch(u_shape, stitch_length_mm=3.0, density_mm=2.0)
+    stitches = generate_fill_stitch([u_shape], stitch_length_mm=3.0, density_mm=2.0)
     assert stitches
 
     # Rows near y=18 (inside the notch region) should have 2 spans -> 2 jumps
@@ -111,7 +111,7 @@ def test_concave_shape_spans_stay_within_polygon_bounds():
     u_shape = [
         (0, 0), (30, 0), (30, 20), (20, 20), (20, 8), (10, 8), (10, 20), (0, 20),
     ]
-    stitches = generate_fill_stitch(u_shape, stitch_length_mm=3.0, density_mm=2.0)
+    stitches = generate_fill_stitch([u_shape], stitch_length_mm=3.0, density_mm=2.0)
     for x, y, _ in stitches:
         assert -0.5 <= x <= 30.5
         assert -0.5 <= y <= 20.5
@@ -130,8 +130,8 @@ def test_angle_90_rotates_row_direction():
     wide_rect = [(0, 0), (40, 0), (40, 10), (0, 10)]
     density = 2.0
 
-    stitches_0 = generate_fill_stitch(wide_rect, stitch_length_mm=3.0, density_mm=density, angle_deg=0)
-    stitches_90 = generate_fill_stitch(wide_rect, stitch_length_mm=3.0, density_mm=density, angle_deg=90)
+    stitches_0 = generate_fill_stitch([wide_rect], stitch_length_mm=3.0, density_mm=density, angle_deg=0)
+    stitches_90 = generate_fill_stitch([wide_rect], stitch_length_mm=3.0, density_mm=density, angle_deg=90)
 
     runs_0 = sum(1 for _, _, is_jump in stitches_0 if is_jump)
     runs_90 = sum(1 for _, _, is_jump in stitches_90 if is_jump)
@@ -145,7 +145,7 @@ def test_angle_stitches_stay_within_rotated_bounds():
     # A square is rotation-invariant in bounds, so angle shouldn't push any
     # stitch outside the original square regardless of angle.
     square = [(0, 0), (20, 0), (20, 20), (0, 20)]
-    stitches = generate_fill_stitch(square, stitch_length_mm=3.0, density_mm=2.0, angle_deg=35)
+    stitches = generate_fill_stitch([square], stitch_length_mm=3.0, density_mm=2.0, angle_deg=35)
     for x, y, _ in stitches:
         assert -1.0 <= x <= 21.0
         assert -1.0 <= y <= 21.0
@@ -157,8 +157,8 @@ def test_angle_stitches_stay_within_rotated_bounds():
 
 def test_pull_compensation_expands_bounds():
     rect = [(0, 0), (20, 0), (20, 10), (0, 10)]
-    plain = generate_fill_stitch(rect, stitch_length_mm=3.0, density_mm=2.0)
-    expanded = generate_fill_stitch(rect, stitch_length_mm=3.0, density_mm=2.0, pull_compensation_mm=1.0)
+    plain = generate_fill_stitch([rect], stitch_length_mm=3.0, density_mm=2.0)
+    expanded = generate_fill_stitch([rect], stitch_length_mm=3.0, density_mm=2.0, pull_compensation_mm=1.0)
 
     plain_xs = [x for x, _, _ in plain]
     expanded_xs = [x for x, _, _ in expanded]
@@ -168,7 +168,7 @@ def test_pull_compensation_expands_bounds():
 
 def test_too_few_points_raises():
     try:
-        generate_fill_stitch([(0, 0), (10, 0)], stitch_length_mm=2.0, density_mm=2.0)
+        generate_fill_stitch([[(0, 0), (10, 0)]], stitch_length_mm=2.0, density_mm=2.0)
         assert False, "expected ValueError"
     except ValueError:
         pass
@@ -176,7 +176,7 @@ def test_too_few_points_raises():
 
 def test_zero_density_raises():
     try:
-        generate_fill_stitch([(0, 0), (10, 0), (10, 10)], stitch_length_mm=2.0, density_mm=0)
+        generate_fill_stitch([[(0, 0), (10, 0), (10, 10)]], stitch_length_mm=2.0, density_mm=0)
         assert False, "expected ValueError"
     except ValueError:
         pass
@@ -184,7 +184,7 @@ def test_zero_density_raises():
 
 def test_zero_stitch_length_raises():
     try:
-        generate_fill_stitch([(0, 0), (10, 0), (10, 10)], stitch_length_mm=0, density_mm=2.0)
+        generate_fill_stitch([[(0, 0), (10, 0), (10, 10)]], stitch_length_mm=0, density_mm=2.0)
         assert False, "expected ValueError"
     except ValueError:
         pass
@@ -192,7 +192,7 @@ def test_zero_stitch_length_raises():
 
 def test_degenerate_zero_area_polygon_raises():
     try:
-        generate_fill_stitch([(0, 0), (10, 0), (20, 0)], stitch_length_mm=2.0, density_mm=2.0)
+        generate_fill_stitch([[(0, 0), (10, 0), (20, 0)]], stitch_length_mm=2.0, density_mm=2.0)
         assert False, "expected ValueError for a zero-area (collinear) polygon"
     except ValueError:
         pass
@@ -212,7 +212,7 @@ def test_fill_to_dst_roundtrip():
             EmbroideryObject(
                 id="fill-1",
                 type=ObjectType.FILL,
-                geometry=rect,
+                geometry=[rect],
                 color="#2E8B57",
                 stitch_settings=StitchSettings(stitch_length_mm=3.0, density_mm=2.0),
                 sequence=0,
@@ -264,7 +264,7 @@ def test_all_three_stitch_types_together():
             EmbroideryObject(
                 id="body",
                 type=ObjectType.FILL,
-                geometry=[(0, 12), (20, 12), (20, 22), (0, 22)],
+                geometry=[[(0, 12), (20, 12), (20, 22), (0, 22)]],
                 color="#2E8B57",
                 stitch_settings=StitchSettings(stitch_length_mm=3.0, density_mm=2.0),
                 sequence=2,

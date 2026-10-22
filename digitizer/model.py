@@ -41,7 +41,12 @@ class StitchSettings:
 class EmbroideryObject:
     id: str
     type: ObjectType
-    geometry: list[Point]               # meaning depends on `type` (see stitches/*)
+    geometry: Any                       # shape depends on `type`: RUNNING is a flat
+                                         # list[Point] polyline; SATIN is a flat list of
+                                         # rail-A/rail-B rung pairs [A0,B0,A1,B1,...]; FILL
+                                         # is a list of rings (geometry[0]=outer boundary,
+                                         # geometry[1:]=holes), each ring a list[Point].
+                                         # See stitches/*/generator.py for exact contracts.
     color: str                          # hex, e.g. "#111111"
     stitch_settings: StitchSettings = field(default_factory=StitchSettings)
     sequence: int = 0                   # stitch-out order; routing.py may reassign this
