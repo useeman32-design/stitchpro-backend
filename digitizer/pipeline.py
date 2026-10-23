@@ -55,6 +55,18 @@ _DEFAULT_DENSITY_MM_BY_STYLE = {
                     # texture needs cells large enough to actually read as
                     # individual X's rather than a solid-looking fill.
 }
+# A satin "edge walk" border traced around every region's outer boundary and
+# holes (see digitizer/stitches/satin/border.py) hides the raw scanline/grid
+# edge FILL and CROSS_STITCH otherwise leave behind -- the single biggest
+# visible difference between an auto-digitized-looking fill and a
+# professional one. FILL gets one on by default (same 1.2-1.4mm range real
+# digitizers use for a logo's outline satin); CROSS_STITCH stays borderless
+# by default since a crisp vector edge would fight its deliberately
+# pixelated/sampler look.
+_DEFAULT_BORDER_MM_BY_STYLE = {
+    "fill": 1.2,
+    "cross": 0.0,
+}
 
 
 def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
@@ -81,6 +93,7 @@ def image_to_design(
     angle_deg: float = 0.0,
     stitch_style: str = "fill",
     smooth_curves: bool = True,
+    border_width_mm: float | None = None,
 ) -> EmbroideryDesign:
     """Digitize a raw image into an EmbroideryDesign of stitch objects, one
     (or more, if a color appears in several disconnected regions) per
@@ -90,6 +103,11 @@ def image_to_design(
     whichever `stitch_style` was chosen (see `_DEFAULT_DENSITY_MM_BY_STYLE`)
     rather than forcing one fixed number to do double duty as both a
     sensible fill-row spacing and a sensible cross-stitch cell size.
+
+    `border_width_mm` likewise defaults (when left `None`) per
+    `_DEFAULT_BORDER_MM_BY_STYLE` -- a satin edge-walk border around every
+    region's outline and holes for FILL, none for CROSS_STITCH. Pass `0`
+    explicitly to disable it for FILL too.
 
     Raises ValueError for an unreadable image, degenerate dimensions, an
     unrecognized `stitch_style`, or an image with no detectable foreground
@@ -108,6 +126,10 @@ def image_to_design(
     effective_density_mm = density_mm if density_mm is not None else _DEFAULT_DENSITY_MM_BY_STYLE[stitch_style]
     if effective_density_mm <= 0:
         raise ValueError("density_mm must be > 0")
+
+    effective_border_mm = border_width_mm if border_width_mm is not None else _DEFAULT_BORDER_MM_BY_STYLE[stitch_style]
+    if effective_border_mm < 0:
+        raise ValueError("border_width_mm must be >= 0")
 
     try:
         img = load_and_downscale(image_bytes, max_dim)
@@ -147,6 +169,7 @@ def image_to_design(
                         stitch_length_mm=stitch_length_mm,
                         density_mm=effective_density_mm,
                         angle_deg=angle_deg,
+                        border_width_mm=effective_border_mm,
                     ),
                     sequence=seq,
                     layer=0,

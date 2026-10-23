@@ -202,6 +202,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         max_colors = _int_field("max_colors", 6)
         stitch_length_mm = _float_field("stitch_length_mm", 3.0)
         density_mm = _optional_float_field("density_mm")
+        border_width_mm = _optional_float_field("border_width_mm")
         angle_deg = _float_field("angle_deg", 0.0)
         max_dim = _int_field("max_dim", 150)
         smooth_curves = _bool_field("smooth_curves", True)
@@ -225,6 +226,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             angle_deg=angle_deg,
             stitch_style=stitch_style,
             smooth_curves=smooth_curves,
+            border_width_mm=border_width_mm,
         )
     except ValueError as e:
         return None, (jsonify({"error": str(e)}), 400)

@@ -38,6 +38,15 @@ class StitchSettings:
     angle_deg: float = 0.0              # SATIN/FILL/CROSS_STITCH stitch direction
     underlay: str | None = None         # None | "edge_run" | "center_run" | "zigzag"
     pull_compensation_mm: float = 0.0   # SATIN/FILL outward expansion
+    border_width_mm: float = 0.0        # FILL/CROSS_STITCH only: width of a satin
+                                         # "edge walk" column traced around the
+                                         # region's outer boundary and every hole,
+                                         # stitched on top of the fill/cross-stitch
+                                         # to hide its jagged scanline/grid edge
+                                         # under a clean vector-traced outline (see
+                                         # stitches/satin/border.py). 0 = no border
+                                         # (back-compat default for callers that
+                                         # built a FILL object before this existed).
 
 
 @dataclass
