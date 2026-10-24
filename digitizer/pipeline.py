@@ -23,10 +23,20 @@ other design built this way.
 `stitch_style` selects FILL (tatami rows, the default -- best for solid
 color regions and most logos/graphics) or CROSS_STITCH (a grid of X's --
 better for a deliberately pixelated/sampler-style design) for *every*
-detected region in the design. Per-region automatic style classification
-(e.g. recognizing a thin/elongated region and digitizing it as a SATIN
-column instead) is a known follow-up, not implemented yet -- see
-continue.md.
+detected region in the design. When `stitch_style="fill"`, each region is
+additionally checked for automatic SATIN classification (see
+digitizer.stitches.satin.thin_region) before falling back to FILL: a thin,
+elongated, hole-free region (a font glyph's straight stroke, a badge's
+border bar, a ruled line) is a poor fit for tatami fill -- a handful of
+short rows through a narrow shape reads as sparse scattered lines rather
+than a clean stitched stroke, the single biggest gap found when comparing
+our output against real professional reference files, where text/line-art
+content is built almost entirely from satin columns. Classification is
+deliberately conservative (see that module's docstring for exactly why) --
+curved shapes and anything with a hole keep today's FILL(+border)
+treatment, only genuinely straight-enough thin regions get the new
+treatment -- so this is a purely additive quality improvement, never a
+regression risk for shapes it doesn't apply to.
 """
 
 from __future__ import annotations
@@ -39,6 +49,11 @@ from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, Stit
 from digitizer.segmentation.background_removal import compute_background_mask
 from digitizer.segmentation.color_quantize import build_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
+from digitizer.stitches.satin.thin_region import (
+    generate_satin_rungs_for_thin_region,
+    is_satin_eligible,
+)
+
 
 # Default resolution for the standalone background-removal *preview*
 # (`remove_background_preview` below) -- deliberately much higher than
@@ -184,22 +199,43 @@ def image_to_design(
             continue
         threads.append(color_hex)
         for i, rings in enumerate(ring_groups):
-            objects.append(
-                EmbroideryObject(
-                    id=f"region-{color_index}-{i}",
-                    type=object_type,
-                    geometry=rings,
-                    color=color_hex,
-                    stitch_settings=StitchSettings(
-                        stitch_length_mm=stitch_length_mm,
-                        density_mm=effective_density_mm,
-                        angle_deg=angle_deg,
-                        border_width_mm=effective_border_mm,
-                    ),
-                    sequence=seq,
-                    layer=0,
+            # Only FILL regions are considered for auto-SATIN -- CROSS_STITCH
+            # is a deliberate stylistic choice the user made explicitly for
+            # every region, not something a thin-shape heuristic should
+            # override (see module docstring and thin_region.py's).
+            satin_rungs = None
+            if stitch_style == "fill" and is_satin_eligible(rings):
+                satin_rungs = generate_satin_rungs_for_thin_region(rings[0])
+
+            if satin_rungs is not None:
+                objects.append(
+                    EmbroideryObject(
+                        id=f"region-{color_index}-{i}",
+                        type=ObjectType.SATIN,
+                        geometry=satin_rungs,
+                        color=color_hex,
+                        stitch_settings=StitchSettings(density_mm=effective_density_mm),
+                        sequence=seq,
+                        layer=0,
+                    )
                 )
-            )
+            else:
+                objects.append(
+                    EmbroideryObject(
+                        id=f"region-{color_index}-{i}",
+                        type=object_type,
+                        geometry=rings,
+                        color=color_hex,
+                        stitch_settings=StitchSettings(
+                            stitch_length_mm=stitch_length_mm,
+                            density_mm=effective_density_mm,
+                            angle_deg=angle_deg,
+                            border_width_mm=effective_border_mm,
+                        ),
+                        sequence=seq,
+                        layer=0,
+                    )
+                )
             seq += 1
 
     if not objects:
