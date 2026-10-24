@@ -206,6 +206,40 @@ def compute_background_mask(
     material (or an enclosed hole matching it), `False` = design
     foreground, for `rgba` (any PIL mode -- converted to RGBA internally).
 
+    Thin wrapper around `compute_background_mask_and_reference` for callers
+    that only need the mask -- see that function for the full parameter
+    docs and for callers (color_quantize.py) that also need the detected
+    background's own reference colors, e.g. to recognize an anti-aliased
+    edge pixel as "a blend of some foreground color toward the background"
+    rather than a new color in its own right.
+    """
+    mask, _reference = compute_background_mask_and_reference(
+        rgba,
+        alpha_threshold=alpha_threshold,
+        step_tolerance=step_tolerance,
+        hole_tolerance=hole_tolerance,
+        tunnel_tolerance=tunnel_tolerance,
+        closing_radius=closing_radius,
+    )
+    return mask
+
+
+def compute_background_mask_and_reference(
+    rgba: Image.Image,
+    alpha_threshold: int = 16,
+    step_tolerance: float = 30.0,
+    hole_tolerance: float = 28.0,
+    tunnel_tolerance: float = 45.0,
+    closing_radius: int = 1,
+) -> tuple[list[list[bool]], list[Rgb]]:
+    """Same background-detection pipeline as `compute_background_mask`, but
+    also returns the trusted reference palette (the image border/
+    transparent seed pixels' own representative colors) it built along the
+    way -- color_quantize.py's anti-aliasing-aware merge step needs this to
+    recognize a graduated edge blend (text/logo color fading toward the
+    *actual detected* background, not just "toward white") as one design
+    color, not several.
+
     `step_tolerance` is a *local* (neighbor-to-neighbor) RGB-distance
     budget for the border-connectivity flood fill. `tunnel_tolerance` is a
     looser distance-to-trusted-seed-color budget used to catch and reject
@@ -217,6 +251,7 @@ def compute_background_mask(
     distance-to-reference-color budget used only for pixels the flood fill
     couldn't reach at all, to catch enclosed background-colored holes.
     """
+
     img = rgba.convert("RGBA")
     w, h = img.size
 
@@ -239,7 +274,7 @@ def compute_background_mask(
     if closing_radius > 0:
         mask = _morphological_close(mask, w, h, closing_radius)
 
-    return mask
+    return mask, reference
 
 
 def _morphological_close(mask: list[list[bool]], w: int, h: int, radius: int) -> list[list[bool]]:

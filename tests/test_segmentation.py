@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from digitizer.segmentation.color_quantize import BACKGROUND_LABEL, build_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
@@ -103,6 +103,43 @@ class TestBuildLabelGrid:
             for x in range(10, 15):
                 img.putpixel((x, y), (21, 61, 161))  # 1 unit off, same thread in practice
         palette, grid = build_label_grid(img, max_colors=4)
+        used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
+        assert len(used_labels) == 1
+
+    def test_heavily_anti_aliased_thin_stroke_stays_one_color(self):
+        # Regression test for a real, observed failure: a thin shape (a
+        # font glyph's stroke, a logo's outline) is mostly *edge* relative
+        # to its own area, so downscaling it can produce a hundred-plus
+        # distinct intermediate gray shades between "full ink" and "full
+        # background" even though only one real design color is involved
+        # -- unlike test_two_distinct_colors_survive_anti_aliased_downscale
+        # above, where the halo is a thin minority around large flat
+        # interior blocks. Before the blend-line merge pass, a small
+        # `max_colors` budget (as low as the default 6) forced MEDIANCUT to
+        # spend its whole budget on different points along that one
+        # gradient, fragmenting one solid-black stroke into several
+        # unmerged near-black/gray "thread colors" -- exactly the "fill
+        # isn't solid, looks like scattered lines" symptom reported against
+        # real text/logo designs.
+        big = Image.new("RGB", (400, 400), (255, 255, 255))
+        draw = ImageDraw.Draw(big)
+        draw.line([(20, 20), (380, 380)], fill=(20, 20, 20), width=14)
+        small = big.resize((100, 100), Image.LANCZOS)
+
+        fg_pixel_colors = {
+            small.getpixel((x, y))
+            for y in range(small.height)
+            for x in range(small.width)
+            if small.getpixel((x, y)) != (255, 255, 255)
+        }
+        # Sanity check the test fixture actually exercises heavy
+        # anti-aliasing (many distinct intermediate shades relative to a
+        # thin stroke's small pixel count), not just a couple of edge
+        # pixels -- otherwise this wouldn't be reproducing the real-world
+        # failure at all.
+        assert len(fg_pixel_colors) > 30
+
+        palette, grid = build_label_grid(small, max_colors=6)
         used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
         assert len(used_labels) == 1
 
