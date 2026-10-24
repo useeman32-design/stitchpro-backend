@@ -46,7 +46,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flask import Flask, Response, jsonify, request, send_file
 
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
-from digitizer.pipeline import MAX_MAX_DIM, MIN_MAX_DIM, STITCH_STYLES, image_to_design
+from digitizer.pipeline import (
+    MAX_MAX_DIM,
+    MIN_MAX_DIM,
+    PREVIEW_MAX_DIM,
+    PREVIEW_MAX_MAX_DIM,
+    PREVIEW_MIN_MAX_DIM,
+    STITCH_STYLES,
+    image_to_design,
+    remove_background_preview,
+)
 from digitizer.points_export import design_to_points
 from formats.dst.writer import design_to_dst_bytes
 from formats.writer import SUPPORTED_FORMATS, design_to_format_bytes, points_to_format_bytes
@@ -206,6 +215,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         angle_deg = _float_field("angle_deg", 0.0)
         max_dim = _int_field("max_dim", 150)
         smooth_curves = _bool_field("smooth_curves", True)
+        remove_background = _bool_field("remove_background", True)
         stitch_style = str(form.get("stitch_style") or "fill").strip().lower()
         if stitch_style not in STITCH_STYLES:
             return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
@@ -227,6 +237,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             stitch_style=stitch_style,
             smooth_curves=smooth_curves,
             border_width_mm=border_width_mm,
+            remove_background=remove_background,
         )
     except ValueError as e:
         return None, (jsonify({"error": str(e)}), 400)
@@ -269,6 +280,13 @@ def image_to_file():
                          Sharp corners are always preserved either way; set
                          to false only to get the raw simplified-polygon
                          boundary.
+      remove_background: optional bool, default true -- removes the
+                         detected background/surrounding material before
+                         digitizing (see /api/design/remove-background and
+                         digitizer/segmentation/background_removal.py).
+                         Pass false only once the user has explicitly
+                         chosen "keep original" on that preview step, so
+                         the final design matches what they approved.
       max_dim         : optional int, caps the longest image side (in
                          pixels) actually processed, default 150 -- keeps
                          server-side processing cheap regardless of the
@@ -340,6 +358,61 @@ def image_to_points():
         return jsonify({"error": str(e)}), 400
 
     return jsonify(result)
+
+
+@app.post("/api/design/remove-background")
+def remove_background():
+    """
+    Standalone background-removal *preview* -- brief follow-up: "let a user
+    see what will be extracted from their photo and require an explicit
+    confirmation before digitizing, never silently apply it automatically".
+
+    Unlike /api/design/image-to-file and /api/design/image-to-points, this
+    route does no quantizing, segmentation, or stitch generation at all --
+    it just runs the same background/surrounding-material detection those
+    routes use internally (digitizer.segmentation.background_removal) and
+    returns a real PNG with every detected background pixel's alpha channel
+    zeroed out, at a much higher resolution than the digitizing pipeline's
+    150px cap, since this image is only ever looked at by a human.
+
+    Multipart form-data request:
+      image   : required, the raw image file (PNG/JPEG/etc).
+      max_dim : optional int, caps the longest processed side in pixels,
+                default 900 (digitizer.pipeline.PREVIEW_MAX_DIM).
+
+    Returns the PNG directly (mimetype image/png, not a download
+    attachment, so a client can drop it straight into an <img>/Image
+    source) on success, or {"error": "..."} with a 400 status on a missing/
+    unreadable image or an out-of-range max_dim.
+
+    A client that calls this is expected to show the result to the user
+    and let them choose between continuing with the background removed
+    (pass `remove_background=true`, the default, to the digitize/export
+    endpoints -- no need to re-upload the processed PNG, the server
+    recomputes the identical mask) or keeping the original image untouched
+    (pass `remove_background=false` to those same endpoints instead).
+    """
+    image_file = request.files.get("image")
+    if image_file is None or image_file.filename == "":
+        return jsonify({"error": "'image' file field is required"}), 400
+
+    raw_max_dim = request.form.get("max_dim")
+    try:
+        max_dim = PREVIEW_MAX_DIM if raw_max_dim in (None, "") else int(raw_max_dim)
+    except (TypeError, ValueError):
+        return jsonify({"error": "'max_dim' must be an integer"}), 400
+    if not (PREVIEW_MIN_MAX_DIM <= max_dim <= PREVIEW_MAX_MAX_DIM):
+        return (
+            jsonify({"error": f"'max_dim' must be between {PREVIEW_MIN_MAX_DIM} and {PREVIEW_MAX_MAX_DIM}"}),
+            400,
+        )
+
+    try:
+        png_bytes = remove_background_preview(image_file.read(), max_dim=max_dim)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return send_file(io.BytesIO(png_bytes), mimetype="image/png")
 
 
 if __name__ == "__main__":

@@ -36,8 +36,23 @@ import io
 from PIL import Image
 
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
+from digitizer.segmentation.background_removal import compute_background_mask
 from digitizer.segmentation.color_quantize import build_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
+
+# Default resolution for the standalone background-removal *preview*
+# (`remove_background_preview` below) -- deliberately much higher than
+# DEFAULT_MAX_DIM (150), since this image is only ever shown to the user
+# for a yes/no "does this look right" confirmation, never fed through the
+# stitch generators, so there's no reason to pay the same aggressive
+# downscale the full digitizing pipeline needs to stay cheap. Bounds are
+# their own, separate range from MIN_MAX_DIM/MAX_MAX_DIM (which cap the
+# *digitizing* pipeline's resolution, deliberately much lower) -- a caller
+# can reasonably ask this preview-only endpoint for a crisper image than
+# the stitch pipeline would ever accept.
+PREVIEW_MAX_DIM = 900
+PREVIEW_MIN_MAX_DIM = 16
+PREVIEW_MAX_MAX_DIM = 2000
 
 # Keep server-side processing cheap regardless of what the client uploads --
 # see docs/embroidery-engine-research.md's cPanel CPU/timeout concerns. 150px
@@ -94,6 +109,7 @@ def image_to_design(
     stitch_style: str = "fill",
     smooth_curves: bool = True,
     border_width_mm: float | None = None,
+    remove_background: bool = True,
 ) -> EmbroideryDesign:
     """Digitize a raw image into an EmbroideryDesign of stitch objects, one
     (or more, if a color appears in several disconnected regions) per
@@ -108,6 +124,15 @@ def image_to_design(
     `_DEFAULT_BORDER_MM_BY_STYLE` -- a satin edge-walk border around every
     region's outline and holes for FILL, none for CROSS_STITCH. Pass `0`
     explicitly to disable it for FILL too.
+
+    `remove_background` (default `True`) runs the same border-connected
+    flood-fill background/surrounding-material removal
+    (digitizer.segmentation.background_removal) the standalone
+    `remove_background_preview` function below shows the user ahead of
+    time. Pass `False` only when the user explicitly chose "keep original"
+    on that preview step -- every pixel is then treated as foreground
+    (subject only to its own alpha channel), so the final digitized design
+    matches exactly what they were shown and agreed to.
 
     Raises ValueError for an unreadable image, degenerate dimensions, an
     unrecognized `stitch_style`, or an image with no detectable foreground
@@ -140,7 +165,7 @@ def image_to_design(
     px_to_mm_x = width_mm / w
     px_to_mm_y = height_mm / h
 
-    palette_hex, label_grid = build_label_grid(img, max_colors)
+    palette_hex, label_grid = build_label_grid(img, max_colors, remove_background=remove_background)
 
     object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
 
@@ -189,3 +214,47 @@ def image_to_design(
         objects=objects,
         threads=threads,
     )
+
+
+def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM) -> bytes:
+    """
+    Standalone background-removal *preview* step (brief follow-up: "show
+    the user what will be extracted from their photo and require an
+    explicit confirmation before digitizing, never silently apply it").
+
+    Runs the exact same border-connected flood-fill background detection
+    `image_to_design` uses internally (digitizer.segmentation.
+    background_removal.compute_background_mask) but, unlike the full
+    pipeline, does nothing else with it -- no quantizing, no segmentation,
+    no stitch generation -- and returns a real PNG with every detected
+    background/surrounding-material pixel's alpha channel zeroed out, so a
+    client can render it directly (e.g. over a checkerboard, the universal
+    "this is transparent" convention) for the user to look at and approve.
+
+    Deliberately processed at a much higher resolution (`PREVIEW_MAX_DIM`,
+    900px by default) than the 150px the full digitizing pipeline caps
+    itself to -- this image is only ever looked at by a human, not reduced
+    to stitch geometry, so there's no reason to sacrifice visual fidelity
+    for processing speed here the way the stitch pipeline must.
+
+    Raises ValueError for an unreadable image (same contract as
+    `image_to_design`).
+    """
+    try:
+        img = load_and_downscale(image_bytes, max_dim)
+    except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
+        raise ValueError(f"could not read image: {e}") from e
+
+    rgba = img.convert("RGBA")
+    mask = compute_background_mask(rgba)
+    w, h = rgba.size
+    px = rgba.load()
+    for y in range(h):
+        for x in range(w):
+            if mask[y][x]:
+                r, g, b, _a = px[x, y]
+                px[x, y] = (r, g, b, 0)
+
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    return buf.getvalue()

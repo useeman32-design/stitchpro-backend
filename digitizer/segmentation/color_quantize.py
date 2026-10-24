@@ -97,6 +97,7 @@ def build_label_grid(
     alpha_threshold: int = 16,
     bg_step_tolerance: float = 30.0,
     color_merge_tolerance: float = 18.0,
+    remove_background: bool = True,
 ) -> tuple[list[str], list[list[int]]]:
     """Reduce `img` (any PIL mode, already downscaled by the caller) to at
     most `max_colors` hex colors plus a label grid.
@@ -114,12 +115,24 @@ def build_label_grid(
     small local color steps -- compete for palette slots, so a design's
     real colors are never diluted by a shirt's lighting gradient or a
     photo's compression noise around its edges.
+
+    `remove_background=False` skips the flood fill entirely (every opaque
+    pixel is treated as foreground, matching exactly what the
+    `/api/design/remove-background` preview endpoint showed the user when
+    they chose "keep original" instead of proceeding with the background
+    removed) -- see digitizer/pipeline.py's `image_to_design` docstring for
+    the end-to-end contract this flag preserves between preview and final
+    digitized output.
     """
     rgba = img.convert("RGBA")
     w, h = rgba.size
     rgba_pixels = rgba.load()
 
-    bg_mask = compute_background_mask(rgba, alpha_threshold=alpha_threshold, step_tolerance=bg_step_tolerance)
+    if remove_background:
+        bg_mask = compute_background_mask(rgba, alpha_threshold=alpha_threshold, step_tolerance=bg_step_tolerance)
+    else:
+        bg_mask = [[False] * w for _ in range(h)]
+
 
     fg_coords: list[tuple[int, int]] = []
     fg_colors: list[Rgb] = []
