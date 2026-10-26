@@ -98,6 +98,45 @@ _DEFAULT_BORDER_MM_BY_STYLE = {
     "cross": 0.0,
 }
 
+# Underlay + pull compensation (digitizer/underlay/generator.py and the
+# `pull_compensation_mm` plumbed through every stitches/*/generator.py) have
+# existed and been tested since Milestone 6/the thin-region satin work, but
+# were never actually turned on here -- every StitchSettings built by this
+# pipeline left both at their do-nothing defaults (underlay=None,
+# pull_compensation_mm=0.0), so none of that real, working code ever ran for
+# an actual auto-digitized design. Every reference professional file this
+# project studied uses both: underlay to stabilize the fabric before the top
+# stitch lays down (without it, fill/satin pucker and shift -- a likely
+# contributor to the "rough/inaccurate at high density" feedback), and pull
+# compensation to counter the real, physical fact that thread tension pulls
+# a stitched shape in narrower than its digitized geometry.
+#
+# SATIN (today, exclusively the auto-classified thin/elongated regions from
+# thin_region.py -- narrow columns) gets "center_run": a single run stitch
+# down the column's midline, the standard choice for narrow satin per every
+# digitizing guide consulted (an edge-run underlay on a genuinely narrow
+# column risks peeking out past the finished edge). FILL gets "edge_run":
+# a running stitch just inside the outer boundary and every hole, which
+# stabilizes the perimeter without materially changing the center fill
+# rows. CROSS_STITCH gets no underlay -- its own grid pattern is already a
+# self-stabilizing structure, and the underlay generator intentionally
+# no-ops for it regardless (see underlay/generator.py's docstring).
+_SATIN_UNDERLAY = "center_run"
+_FILL_UNDERLAY = "edge_run"
+
+# Pull compensation: how much every shape's boundary is expanded outward
+# before stitching, so the real (tension-shrunk) result matches the
+# intended size. Satin columns pull in the most (the full stitch crosses
+# the narrow width every pass), fill pulls in less (most of its stitches
+# run lengthwise, only the row ends feel the pull), and a cross-stitch grid
+# barely moves at all (each X is short and self-anchoring) -- 0 is a
+# deliberate, conservative choice there rather than an oversight.
+_SATIN_PULL_COMPENSATION_MM = 0.2
+_DEFAULT_PULL_COMPENSATION_MM_BY_STYLE = {
+    "fill": 0.12,
+    "cross": 0.0,
+}
+
 
 def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
     img = Image.open(io.BytesIO(image_bytes))
@@ -193,7 +232,7 @@ def image_to_design(
             color_index,
             px_to_mm_x,
             px_to_mm_y,
-            smooth_iterations=2 if smooth_curves else 0,
+            smooth_iterations=3 if smooth_curves else 0,
         )
         if not ring_groups:
             continue
@@ -214,7 +253,11 @@ def image_to_design(
                         type=ObjectType.SATIN,
                         geometry=satin_rungs,
                         color=color_hex,
-                        stitch_settings=StitchSettings(density_mm=effective_density_mm),
+                        stitch_settings=StitchSettings(
+                            density_mm=effective_density_mm,
+                            underlay=_SATIN_UNDERLAY,
+                            pull_compensation_mm=_SATIN_PULL_COMPENSATION_MM,
+                        ),
                         sequence=seq,
                         layer=0,
                     )
@@ -231,6 +274,14 @@ def image_to_design(
                             density_mm=effective_density_mm,
                             angle_deg=angle_deg,
                             border_width_mm=effective_border_mm,
+                            # Only ever applies to the FILL branch in
+                            # practice -- generate_underlay_stitches already
+                            # no-ops for CROSS_STITCH regardless of this
+                            # value, kept here rather than branched on
+                            # object_type so this object-construction call
+                            # doesn't need its own copy of that type check.
+                            underlay=_FILL_UNDERLAY if object_type == ObjectType.FILL else None,
+                            pull_compensation_mm=_DEFAULT_PULL_COMPENSATION_MM_BY_STYLE[stitch_style],
                         ),
                         sequence=seq,
                         layer=0,

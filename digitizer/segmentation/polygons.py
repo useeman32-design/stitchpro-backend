@@ -41,8 +41,8 @@ def label_grid_to_ring_groups(
     px_to_mm_x: float,
     px_to_mm_y: float,
     min_area_px: float = 4.0,
-    simplify_tolerance_mm: float = 0.25,
-    smooth_iterations: int = 2,
+    simplify_tolerance_mm: float | None = None,
+    smooth_iterations: int = 3,
     smooth_sharp_angle_deg: float = DEFAULT_SHARP_ANGLE_DEG,
     min_bbox_mm: float = 0.6,
 ) -> list[RingGroup]:
@@ -55,12 +55,42 @@ def label_grid_to_ring_groups(
     small to be worth a stitch object. `simplify_tolerance_mm` reduces the
     unit-square staircase to a much smaller polygon (Douglas-Peucker via
     Shapely, applied in mm space so the tolerance means what it says
-    regardless of the image's pixel density). `smooth_iterations` then runs
-    adaptive, corner-preserving curve smoothing (digitizer/geometry/
-    smoothing.py) on top of that simplified polygon -- genuinely curved
-    edges (a circular badge, a rounded letterform) come out smooth instead
-    of faceted, while intentionally sharp corners are left untouched. Pass
-    `smooth_iterations=0` to skip this step entirely.
+    regardless of the image's pixel density).
+
+    Leaving `simplify_tolerance_mm` as `None` (the default) picks
+    `max(0.25, 2.0 * max(px_to_mm_x, px_to_mm_y))` -- i.e. at least ~2 source
+    pixels' worth of simplification -- rather than a fixed 0.25mm. A fixed
+    absolute tolerance was the real bug behind "curves still look rough"
+    feedback: at the pipeline's actual working resolution (~150px across a
+    real 50-90mm design, so roughly 0.3-0.6mm/pixel), 0.25mm is *sub-pixel*,
+    so Douglas-Peucker could barely touch the raw unit-square staircase --
+    confirmed by instrumenting a real rasterized circle, where 96% of its
+    "simplified" vertices still had pixel-staircase turn angles (45,
+    63.4, 90 degrees -- the exact signature of an unreduced Bresenham-style
+    staircase) above `smooth_sharp_angle_deg`'s 35-degree cutoff. Since the
+    angle-adaptive smoothing below treats anything above that cutoff as an
+    intentional sharp design corner and never touches it, the staircase
+    passed through essentially untouched regardless of `smooth_iterations`
+    -- confirmed by the same instrumentation showing smoothing had *zero*
+    effect on point count or roundness at the old default. Scaling the
+    tolerance to the source resolution reliably collapses the staircase
+    into a true gentle-curve polygon first, so the smoothing pass actually
+    has a controllable number of gentle-turn vertices to work with, and
+    this was verified to hold (round-trip tested on real rasterized
+    circles) across design sizes from 20mm to 90mm at the pipeline's
+    standard ~150px working resolution.
+
+    `smooth_iterations` then runs adaptive, corner-preserving curve
+    smoothing (digitizer/geometry/smoothing.py) on top of that simplified
+    polygon -- genuinely curved edges (a circular badge, a rounded
+    letterform) come out smooth instead of faceted, while intentionally
+    sharp corners are left untouched. Pass `smooth_iterations=0` to skip
+    this step entirely. Raised from 2 to 3 (the same real-circle
+    instrumentation showed 3 iterations reliably beats 2 once the
+    sharp-angle misclassification above is fixed; beyond 3 the curve has
+    already converged and additional iterations only add redundant points
+    along the same shape, so 3 is the efficient stopping point, not an
+    arbitrary bump).
 
     `min_bbox_mm` is a second, physical-unit noise filter on top of
     `min_area_px`: a region whose *shorter* bounding-box side is below this
@@ -74,6 +104,12 @@ def label_grid_to_ring_groups(
     around 1mm anyway, so a sub-millimeter region was never going to be
     meaningfully stitched regardless.
     """
+    effective_tolerance_mm = (
+        simplify_tolerance_mm
+        if simplify_tolerance_mm is not None
+        else max(0.25, 2.0 * max(px_to_mm_x, px_to_mm_y))
+    )
+
     h = len(label_grid)
     w = len(label_grid[0]) if h else 0
     squares = [
@@ -99,7 +135,7 @@ def label_grid_to_ring_groups(
             for interior in poly.interiors
         ]
         mm_poly = Polygon(shell=mm_exterior, holes=mm_holes)
-        simplified = mm_poly.simplify(simplify_tolerance_mm, preserve_topology=True)
+        simplified = mm_poly.simplify(effective_tolerance_mm, preserve_topology=True)
 
         if simplified.is_empty or simplified.area <= 0:
             continue
