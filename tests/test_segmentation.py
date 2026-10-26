@@ -143,6 +143,35 @@ class TestBuildLabelGrid:
         used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
         assert len(used_labels) == 1
 
+    def test_adjacent_design_colors_dont_leak_a_spurious_blend_color(self):
+        # Regression test for a real, observed failure distinct from the
+        # two tests above: those both involve exactly one real foreground
+        # color blending into the *background*, which the blend-line merge
+        # against `background_refs` already handled. This covers two
+        # *different* real design colors that touch each other directly (a
+        # red block overlapping a blue ellipse) -- downscaling/compression
+        # produces a handful of blend pixels along that internal boundary
+        # (e.g. a muddy red-purple that is neither red nor blue), and
+        # without a merge rule that also checks segments between pairs of
+        # *foreground* palette colors (not just against the background),
+        # that blend survived as its own bogus "extra thread color" --
+        # exactly the "color detection shows noisy extra colors beyond the
+        # real count" complaint for any multi-color design. A generous
+        # `max_colors` budget must not surface more than the real 2 colors
+        # here, and must not grow as the budget grows.
+        big = Image.new("RGB", (400, 400), (255, 255, 255))
+        draw = ImageDraw.Draw(big)
+        draw.rectangle([20, 20, 250, 250], fill=(230, 30, 40))
+        draw.ellipse([150, 150, 380, 380], fill=(20, 90, 180))
+        small = big.resize((100, 100), Image.LANCZOS)
+
+        for max_colors in (2, 4, 6, 8):
+            palette, grid = build_label_grid(small, max_colors=max_colors)
+            used_labels = {v for row in grid for v in row if v != BACKGROUND_LABEL}
+            assert len(used_labels) == min(2, max_colors), (
+                f"max_colors={max_colors} produced {len(used_labels)} colors: {palette}"
+            )
+
 
 class TestLabelGridToRingGroups:
     def _square_grid(self, w, h, label, x0, y0, x1, y1):

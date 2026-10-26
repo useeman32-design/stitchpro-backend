@@ -77,6 +77,9 @@ def _merge_near_duplicate_colors(
     merge_tolerance: float,
     background_refs: tuple[Rgb, ...] = (),
     blend_tolerance: float = 12.0,
+    counts: tuple[int, ...] = (),
+    fg_blend_tolerance: float = 15.0,
+    fg_blend_max_count_ratio: float = 0.15,
 ) -> tuple[list[Rgb], list[int]]:
     """Median-cut quantization can split what should be one solid color
     into two (or more) near-identical palette entries -- a real, observed
@@ -106,6 +109,45 @@ def _merge_near_duplicate_colors(
        what lets a 100+-shade gray gradient from a single anti-aliased
        black glyph collapse into one group even though its lightest and
        darkest shades are nowhere near each other in plain RGB distance.
+
+    3. Foreground blend-line `fg_blend_tolerance` (only active when
+       `counts` is given): two *design* colors that touch each other
+       directly -- a red shape overlapping a blue one, text sitting on a
+       colored background swatch -- blend into each other along their
+       shared boundary exactly the same way a shape blends into the
+       background, but rule 2 above only ever tests against
+       `background_refs`, so that boundary's blend pixels (a reddish-
+       purple between a red and a blue region, say) previously survived
+       quantization as their own "real" extra color. This is the actual
+       mechanism behind the "color count shows more colors than the
+       design really has" complaint for any multi-color design (a single
+       foreground-color-on-white logo never hits this path, since its only
+       blend line already goes through rule 2; it only shows up once two
+       *different* design colors share an edge). A palette entry `j` is
+       folded into whichever of two *other* entries `i`/`k` it's closer to
+       when its color sits within `fg_blend_tolerance` of the segment
+       between them -- gated by `fg_blend_max_count_ratio` so a genuinely
+       separate (if minor) design color never gets eaten just because it
+       happens to be roughly colinear with two bigger colors in RGB space:
+       a real boundary-blend sliver's pixel count scales with the shared
+       *perimeter* between two regions, not their area, so it is reliably
+       much smaller than either neighboring region's own count, whereas an
+       intentional small color accent (e.g. a logo's small highlight
+       detail) is not specifically constrained to be small relative to
+       *both* of two particular other colors at once. This is a
+       population-only heuristic (deliberately not also requiring the
+       candidate to be spatially touching `i`/`k`'s pixels -- a real
+       smooth anti-aliasing gradient commonly passes through several
+       intermediate quantize shades in a chain, so a strict "must directly
+       border the pure parent colors" spatial check rejects genuine blend
+       colors as often as it would reject a genuine accent, and was tried
+       and reverted for exactly that reason -- see session notes). Known,
+       accepted limitation: a small design color that happens to be both
+       population-minor relative to two bigger colors *and* RGB-colinear
+       with them can still be merged away; this trades a rare adversarial
+       false-merge for reliably fixing the much more common real bug
+       (genuine cross-color boundary blends surviving as bogus "extra"
+       thread colors).
 
     Returns the deduplicated palette plus an `old_index -> new_index` remap
     list. When a group has more than one member and `background_refs` is
@@ -148,6 +190,23 @@ def _merge_near_duplicate_colors(
                 if _point_segment_dist2(palette_rgb[i], palette_rgb[j], bg) <= blend_tol2:
                     union(i, j)
                     break
+
+    if counts and len(counts) == n:
+        fg_blend_tol2 = fg_blend_tolerance * fg_blend_tolerance
+        for i in range(n):
+            for k in range(i + 1, n):
+                for j in range(n):
+                    if j == i or j == k:
+                        continue
+                    if find(j) == find(i) or find(j) == find(k):
+                        continue
+                    min_parent_count = min(counts[i], counts[k])
+                    if min_parent_count <= 0 or counts[j] > fg_blend_max_count_ratio * min_parent_count:
+                        continue
+                    if _point_segment_dist2(palette_rgb[j], palette_rgb[i], palette_rgb[k]) > fg_blend_tol2:
+                        continue
+                    nearer = i if _dist2(palette_rgb[j], palette_rgb[i]) <= _dist2(palette_rgb[j], palette_rgb[k]) else k
+                    union(j, nearer)
 
     groups: dict[int, list[int]] = {}
     seen_roots: list[int] = []
@@ -314,8 +373,19 @@ def build_label_grid(
     n_colors = min(intermediate_colors, len(q_palette) // 3)
     palette_rgb = [tuple(q_palette[i * 3 : i * 3 + 3]) for i in range(n_colors)]
 
+    # Per-intermediate-color pixel counts, needed by the foreground
+    # blend-line merge rule (see _merge_near_duplicate_colors) to tell a
+    # thin genuine boundary-blend sliver between two design colors apart
+    # from a real, separate, minor design color.
+    intermediate_counts = [0] * n_colors
+    for i in range(len(fg_colors)):
+        intermediate_counts[q_pixels[i, 0]] += 1
+
     merged_palette_rgb, remap = _merge_near_duplicate_colors(
-        palette_rgb, color_merge_tolerance, background_refs=tuple(bg_reference)
+        palette_rgb,
+        color_merge_tolerance,
+        background_refs=tuple(bg_reference),
+        counts=tuple(intermediate_counts),
     )
 
     if len(merged_palette_rgb) > max_colors:
