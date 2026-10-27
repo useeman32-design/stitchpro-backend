@@ -142,3 +142,56 @@ class TestImageToDesign:
         unsmoothed = image_to_design(_letter_o_png(), width_mm=40, height_mm=40, smooth_curves=False)
         assert len(smoothed.objects) == 1
         assert len(unsmoothed.objects) == 1
+
+
+class TestAutoVectorize:
+    """Tests for the `auto_vectorize` classify-then-artworkify step (see
+    pipeline.py's module docstring) and the `artwork_kind`/
+    `artwork_confidence` metadata it records."""
+
+    def test_default_on_clean_flat_art_records_flat_kind(self):
+        # Every existing synthetic test image in this module is flat,
+        # solid-color art -- auto_vectorize defaulting to True must not
+        # change their behavior at all (classify_artwork should correctly
+        # recognize them as 'flat' and skip artworkify).
+        design = image_to_design(_two_color_png(), width_mm=40, height_mm=40)
+        assert design.metadata["artwork_kind"] == "flat"
+        assert len(design.threads) == 2
+
+    def test_auto_vectorize_false_skips_classification(self):
+        design = image_to_design(_two_color_png(), width_mm=40, height_mm=40, auto_vectorize=False)
+        assert design.metadata["artwork_kind"] == "flat (forced)"
+        assert design.metadata["artwork_confidence"] == 1.0
+        assert len(design.threads) == 2
+
+    def test_photo_like_gradient_background_no_longer_collapses_to_one_color(self):
+        # Regression test for the color-collapse bug this segment's work
+        # fixes: a design sitting on a smoothly-shaded (photographic-style)
+        # background used to combinatorially false-merge every foreground
+        # color down to one via color_quantize.py's blend-line heuristic
+        # (see pipeline.py/color_quantize.py docstrings). Two clearly
+        # distinct, well-separated foreground colors over such a background
+        # must still come back as two distinct threads once auto_vectorize
+        # classifies this as a photo and routes it through artworkify with
+        # a tightened background_blend_tolerance.
+        size = 200
+        img = Image.new("RGB", (size, size), (0, 0, 0))
+        px = img.load()
+        for y in range(size):
+            for x in range(size):
+                # Smooth two-axis gradient background with a touch of
+                # per-pixel noise -- enough to read as "photographic" to
+                # classify_artwork without needing a real JPEG.
+                shade = int(40 + 180 * (x / size) * (y / size) + ((x * 7 + y * 13) % 37))
+                px[x, y] = (shade, shade, min(255, shade + 40))
+        d = ImageDraw.Draw(img)
+        d.rectangle([20, 20, 80, 180], fill=(220, 30, 30))
+        d.rectangle([120, 20, 180, 180], fill=(30, 30, 220))
+        design = image_to_design(_png_bytes(img), width_mm=50, height_mm=50, max_colors=6)
+        assert design.metadata["artwork_kind"] == "photo"
+        assert len(design.threads) >= 2
+
+    def test_metadata_always_present(self):
+        design = image_to_design(_letter_o_png(), width_mm=40, height_mm=40)
+        assert "artwork_kind" in design.metadata
+        assert "artwork_confidence" in design.metadata

@@ -67,6 +67,31 @@ class TestImageToPoints:
         assert resp.status_code == 200
         assert len(resp.get_json()["points"]) > 0
 
+    def test_response_includes_artwork_kind_and_confidence(self):
+        client = _client()
+        data = {
+            "image": (io.BytesIO(_png_bytes()), "logo.png"),
+            "width_mm": "40",
+            "height_mm": "40",
+        }
+        resp = client.post("/api/design/image-to-points", data=data, content_type="multipart/form-data")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["artworkKind"] == "flat"
+        assert 0.0 <= body["artworkConfidence"] <= 1.0
+
+    def test_auto_vectorize_false_is_accepted_and_forces_flat(self):
+        client = _client()
+        data = {
+            "image": (io.BytesIO(_png_bytes()), "logo.png"),
+            "width_mm": "40",
+            "height_mm": "40",
+            "auto_vectorize": "false",
+        }
+        resp = client.post("/api/design/image-to-points", data=data, content_type="multipart/form-data")
+        assert resp.status_code == 200
+        assert resp.get_json()["artworkKind"] == "flat (forced)"
+
     def test_invalid_stitch_style_rejected(self):
         client = _client()
         data = {

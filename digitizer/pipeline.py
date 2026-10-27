@@ -9,13 +9,21 @@ api/app.py's module docstring and formats/points_writer.py), this is the
 first endpoint that does real server-side digitizing: given nothing but a
 raw image, decide what the embroidery objects are.
 
-Pipeline: downscale (`load_and_downscale` below) -> quantize + remove
-background/surrounding material via a border-connected flood fill
-(digitizer.segmentation.color_quantize + background_removal -- robust to a
-real photographed garment's lighting/shading, not just a flat studio
-backdrop) -> per-color connected regions with holes, curve-smoothed, in mm
-space (digitizer.segmentation.polygons) -> one stitch object per region,
-styled per `stitch_style`. Routing (digitizer.routing.router, used
+Pipeline: downscale (`load_and_downscale` below) -> classify as flat
+artwork or a photograph (digitizer.classifier.classify_artwork) -> for a
+photograph, flatten it into something the rest of this pipeline already
+knows how to handle well (digitizer.segmentation.artworkify: denoise,
+contrast-stretch, posterize) -- this is the actual fix for "a real photo
+of a design digitizes badly": the flat-art pipeline below was never the
+problem, feeding it raw photographic gradients/lighting/texture was (see
+`artworkify`'s and `color_quantize.build_label_grid`'s
+`background_blend_tolerance` docstrings for exactly how and why that broke)
+-> quantize + remove background/surrounding material via a border-connected
+flood fill (digitizer.segmentation.color_quantize + background_removal --
+robust to a real photographed garment's lighting/shading, not just a flat
+studio backdrop) -> per-color connected regions with holes, curve-smoothed,
+in mm space (digitizer.segmentation.polygons) -> one stitch object per
+region, styled per `stitch_style`. Routing (digitizer.routing.router, used
 automatically by formats/dst/writer.py:compile_design) then groups same-
 color objects together and orders them for minimal travel, exactly like any
 other design built this way.
@@ -45,7 +53,9 @@ import io
 
 from PIL import Image
 
+from digitizer.classifier.classify_artwork import classify_artwork
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
+from digitizer.segmentation.artworkify import artworkify
 from digitizer.segmentation.background_removal import compute_background_mask
 from digitizer.segmentation.color_quantize import build_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
@@ -53,6 +63,16 @@ from digitizer.stitches.satin.thin_region import (
     generate_satin_rungs_for_thin_region,
     is_satin_eligible,
 )
+
+# Rule 2's blend-tolerance inside color_quantize._merge_near_duplicate_colors,
+# used specifically for a design this pipeline has run through `artworkify`
+# -- see build_label_grid's `background_blend_tolerance` docstring for why
+# the ordinary default (12.0, tuned for a single solid background color)
+# reliably collapses a photographed design's genuinely distinct colors down
+# to one once the background itself carries a dozen-plus gradient reference
+# shades, and why a small-but-nonzero value (rather than disabling the rule
+# outright) is the correct fix.
+_PHOTO_BACKGROUND_BLEND_TOLERANCE = 2.0
 
 
 # Default resolution for the standalone background-removal *preview*
@@ -164,10 +184,25 @@ def image_to_design(
     smooth_curves: bool = True,
     border_width_mm: float | None = None,
     remove_background: bool = True,
+    auto_vectorize: bool = True,
 ) -> EmbroideryDesign:
     """Digitize a raw image into an EmbroideryDesign of stitch objects, one
     (or more, if a color appears in several disconnected regions) per
     detected color, sized to fit `width_mm` x `height_mm`.
+
+    `auto_vectorize` (default `True`) runs `classify_artwork` on the
+    (downscaled) image first and, only when it's classified `'photo'`, runs
+    it through `artworkify` before anything else below ever sees it -- see
+    the module docstring for why this is the actual fix for "a real photo
+    digitizes badly", not a resolution or quantization-tuning problem. The
+    detected `artwork_kind` (`'flat'` or `'photo'`, or `'flat (forced)'`
+    when `auto_vectorize=False` skipped classification entirely) and its
+    confidence are recorded on the returned design's `metadata` dict for
+    callers that want to show the user what was detected. Pass `False`
+    only to reproduce the exact pre-existing behavior (e.g. a regression
+    test pinned to the old flat-art-only pipeline, or a caller that already
+    knows its input is a clean vector export and wants to skip the
+    classification work entirely).
 
     `density_mm` left as `None` (the default) picks a sensible default for
     whichever `stitch_style` was chosen (see `_DEFAULT_DENSITY_MM_BY_STYLE`)
@@ -219,7 +254,24 @@ def image_to_design(
     px_to_mm_x = width_mm / w
     px_to_mm_y = height_mm / h
 
-    palette_hex, label_grid = build_label_grid(img, max_colors, remove_background=remove_background)
+    label_grid_kwargs: dict[str, float] = {}
+    if auto_vectorize:
+        artwork_info = classify_artwork(img)
+        artwork_kind = artwork_info["kind"]
+        artwork_confidence = artwork_info["confidence"]
+        if artwork_kind == "photo":
+            img = artworkify(img)
+            label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
+    else:
+        artwork_kind = "flat (forced)"
+        artwork_confidence = 1.0
+
+    palette_hex, label_grid = build_label_grid(
+        img,
+        max_colors,
+        remove_background=remove_background,
+        **label_grid_kwargs,
+    )
 
     object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
 
@@ -300,6 +352,7 @@ def image_to_design(
         height_mm=height_mm,
         objects=objects,
         threads=threads,
+        metadata={"artwork_kind": artwork_kind, "artwork_confidence": artwork_confidence},
     )
 
 

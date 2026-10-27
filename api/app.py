@@ -216,6 +216,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         max_dim = _int_field("max_dim", 150)
         smooth_curves = _bool_field("smooth_curves", True)
         remove_background = _bool_field("remove_background", True)
+        auto_vectorize = _bool_field("auto_vectorize", True)
         stitch_style = str(form.get("stitch_style") or "fill").strip().lower()
         if stitch_style not in STITCH_STYLES:
             return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
@@ -238,6 +239,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             smooth_curves=smooth_curves,
             border_width_mm=border_width_mm,
             remove_background=remove_background,
+            auto_vectorize=auto_vectorize,
         )
     except ValueError as e:
         return None, (jsonify({"error": str(e)}), 400)
@@ -287,6 +289,17 @@ def image_to_file():
                          Pass false only once the user has explicitly
                          chosen "keep original" on that preview step, so
                          the final design matches what they approved.
+      auto_vectorize  : optional bool, default true -- classifies the image
+                         as flat artwork or a photograph first
+                         (digitizer/classifier/classify_artwork.py) and, for
+                         a photograph, flattens it into clean flat-art-like
+                         input before quantizing
+                         (digitizer/segmentation/artworkify.py). This is
+                         what actually fixes "a real photo digitizes badly"
+                         -- the detected kind is in the response for
+                         /api/design/image-to-points (not surfaced on this
+                         binary-file endpoint). Pass false only to force the
+                         old flat-art-only behavior.
       max_dim         : optional int, caps the longest image side (in
                          pixels) actually processed, default 150 -- keeps
                          server-side processing cheap regardless of the
@@ -336,14 +349,23 @@ def image_to_points():
 
     Multipart form-data request: same fields as /api/design/image-to-file
     (image, width_mm, height_mm, max_colors, stitch_length_mm, density_mm,
-    angle_deg, stitch_style, smooth_curves, max_dim), except there is no
-    `format`/`name` field -- those only make sense for a file download.
+    angle_deg, stitch_style, smooth_curves, max_dim, auto_vectorize), except
+    there is no `format`/`name` field -- those only make sense for a file
+    download.
 
     Response JSON on success:
       {"width_mm": ..., "height_mm": ...,
        "threads": ["#RRGGBB", ...],
        "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
-                   "command": "jump"|"stitch"|"colorChange"}, ...]}
+                   "command": "jump"|"stitch"|"colorChange"}, ...],
+       "artworkKind": "flat"|"photo"|"flat (forced)",
+       "artworkConfidence": 0..1}
+
+    `artworkKind`/`artworkConfidence` come straight from
+    `classify_artwork`/`auto_vectorize` (digitizer/pipeline.py) -- purely
+    informational, e.g. for a client that wants to tell the user "detected
+    as a photo, auto-converted to artwork" rather than silently changing
+    behavior under them.
 
     Or {"error": "..."} with a 400 status on a malformed request, an
     unreadable image, or an image with no detectable foreground.
@@ -357,6 +379,8 @@ def image_to_points():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    result["artworkKind"] = design.metadata.get("artwork_kind")
+    result["artworkConfidence"] = design.metadata.get("artwork_confidence")
     return jsonify(result)
 
 

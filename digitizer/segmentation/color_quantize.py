@@ -289,6 +289,7 @@ def build_label_grid(
     bg_step_tolerance: float = 30.0,
     color_merge_tolerance: float = 18.0,
     remove_background: bool = True,
+    background_blend_tolerance: float = 12.0,
 ) -> tuple[list[str], list[list[int]]]:
     """Reduce `img` (any PIL mode, already downscaled by the caller) to at
     most `max_colors` hex colors plus a label grid.
@@ -328,6 +329,28 @@ def build_label_grid(
     removed) -- see digitizer/pipeline.py's `image_to_design` docstring for
     the end-to-end contract this flag preserves between preview and final
     digitized output.
+
+    `background_blend_tolerance` is rule 2's own tolerance inside
+    `_merge_near_duplicate_colors` (see that function's docstring) -- how
+    close a palette color needs to lie to the line between another palette
+    color and a detected background reference color to be folded into it,
+    i.e. "this is just an anti-aliased edge blending into the background,
+    not a real extra color". The default (12.0) is tuned for the common
+    case this rule exists for: a flat logo on a *single* solid (or
+    near-solid) background color. It breaks down for a background with
+    many genuinely different reference shades across it (a photographed
+    garment's lighting gradient, picked up as a dozen-plus distinct
+    `background_refs` entries) -- with that many candidate lines to test,
+    rule 2 reliably finds *some* plausible-looking blend path connecting
+    almost any two unrelated foreground colors, transitively collapsing a
+    genuinely multi-color design down to one washed-out average (confirmed
+    on this project's own photographed sample assets -- see session notes).
+    Callers that already know their source went through `artworkify.py`
+    (i.e. was classified 'photo') should pass a much smaller value (2.0 was
+    found to reliably fix the collapse above while still catching genuine
+    1-2-shade post-posterize AA edges) rather than disabling this rule
+    outright, which would reopen the original anti-aliasing fragmentation
+    bug this rule was written to fix.
     """
     rgba = img.convert("RGBA")
     w, h = rgba.size
@@ -385,6 +408,7 @@ def build_label_grid(
         palette_rgb,
         color_merge_tolerance,
         background_refs=tuple(bg_reference),
+        blend_tolerance=background_blend_tolerance,
         counts=tuple(intermediate_counts),
     )
 
