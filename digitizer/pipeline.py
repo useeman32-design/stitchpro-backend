@@ -52,6 +52,7 @@ from __future__ import annotations
 import io
 
 from PIL import Image
+from shapely.geometry import Polygon
 
 from digitizer.classifier.classify_artwork import classify_artwork
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
@@ -59,9 +60,12 @@ from digitizer.segmentation.artworkify import artworkify
 from digitizer.segmentation.background_removal import compute_background_mask
 from digitizer.segmentation.color_quantize import build_label_grid, despeckle_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
+from digitizer.stitches.puff.eligibility import is_puff_eligible
 from digitizer.stitches.satin.thin_region import (
     generate_satin_rungs_for_thin_region,
     is_satin_eligible,
+    oriented_bbox_dims,
+    thin_region_treatment,
 )
 
 # Rule 2's blend-tolerance inside color_quantize._merge_near_duplicate_colors,
@@ -166,6 +170,21 @@ _DEFAULT_PULL_COMPENSATION_MM_BY_STYLE = {
     "fill": 0.12,
     "cross": 0.0,
 }
+
+# New stitch type follow-up (Bean/Motif/3D Puff/Applique), all auto-detected
+# like SATIN already was -- same scoping rule as SATIN: only ever considered
+# when `stitch_style == "fill"`, never overriding a user's explicit
+# CROSS_STITCH choice for every region.
+#
+# A single detected region's largest, simplest, most convex FILL shape
+# becomes APPLIQUE only when it's genuinely dominant -- real appliqu\u00e9
+# patches are almost always a design's main background/body silhouette, not
+# an arbitrary detail shape, and wrongly auto-selecting a detail shape here
+# would force a real machine-pause/fabric-handling workflow (see
+# stitches/applique/generator.py) onto a design that never asked for it.
+# Deliberately rare: most designs will have no APPLIQUE region at all.
+_APPLIQUE_MIN_DOMINANT_AREA_FRACTION = 0.40
+_APPLIQUE_MIN_CONVEXITY = 0.85
 
 
 def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
@@ -294,9 +313,15 @@ def image_to_design(
 
     object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
 
-    objects: list[EmbroideryObject] = []
+    # First pass: gather every detected region (across all colors) plus its
+    # outer-boundary area, so the PUFF_3D/APPLIQUE heuristics below can
+    # weigh a region against the rest of the design (e.g. "is this really
+    # the dominant shape?"), not judge it in total isolation. Doesn't
+    # change anything about which regions get detected -- same
+    # label_grid_to_ring_groups call as before, just gathered up front.
+    region_records: list[dict] = []
+    total_foreground_area_mm2 = 0.0
     threads: list[str] = []
-    seq = 0
     for color_index, color_hex in enumerate(palette_hex):
         ring_groups = label_grid_to_ring_groups(
             label_grid,
@@ -309,26 +334,71 @@ def image_to_design(
             continue
         threads.append(color_hex)
         for i, rings in enumerate(ring_groups):
-            # Only FILL regions are considered for auto-SATIN -- CROSS_STITCH
-            # is a deliberate stylistic choice the user made explicitly for
-            # every region, not something a thin-shape heuristic should
-            # override (see module docstring and thin_region.py's).
-            satin_rungs = None
-            if stitch_style == "fill" and is_satin_eligible(rings):
-                satin_rungs = generate_satin_rungs_for_thin_region(rings[0])
+            area_mm2 = 0.0
+            try:
+                poly = Polygon(rings[0])
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                area_mm2 = poly.area
+            except Exception:  # noqa: BLE001 - degenerate ring geometry, treat as zero area
+                area_mm2 = 0.0
+            total_foreground_area_mm2 += area_mm2
+            region_records.append(
+                {"color_index": color_index, "i": i, "color_hex": color_hex, "rings": rings, "area_mm2": area_mm2}
+            )
 
+    objects: list[EmbroideryObject] = []
+    applique_candidates: list[tuple[int, float]] = []  # (index into objects, area_mm2)
+    seq = 0
+    for rec in region_records:
+        color_index, i, color_hex, rings = rec["color_index"], rec["i"], rec["color_hex"], rec["rings"]
+
+        # Only FILL regions are considered for any of the auto-classified
+        # treatments below -- CROSS_STITCH is a deliberate stylistic choice
+        # the user made explicitly for every region, not something a
+        # shape heuristic should override (see module docstring and
+        # thin_region.py's).
+        satin_rungs = None
+        thin_treatment: str | None = None  # "SATIN" | "BEAN" | "MOTIF" | None
+        if stitch_style == "fill" and is_satin_eligible(rings):
+            satin_rungs = generate_satin_rungs_for_thin_region(rings[0])
             if satin_rungs is not None:
+                dims = oriented_bbox_dims(rings[0])
+                thin_treatment = thin_region_treatment(*dims) if dims is not None else "SATIN"
+
+        if thin_treatment == "SATIN":
+            objects.append(
+                EmbroideryObject(
+                    id=f"region-{color_index}-{i}",
+                    type=ObjectType.SATIN,
+                    geometry=satin_rungs,
+                    color=color_hex,
+                    stitch_settings=StitchSettings(
+                        density_mm=effective_density_mm,
+                        underlay=_SATIN_UNDERLAY,
+                        pull_compensation_mm=_SATIN_PULL_COMPENSATION_MM,
+                    ),
+                    sequence=seq,
+                    layer=0,
+                )
+            )
+        elif thin_treatment in ("BEAN", "MOTIF"):
+            # Reuse the already scan-validated satin rung pairs
+            # (guaranteed well-behaved by generate_satin_rungs_for_thin_region
+            # above) as a centerline path, rather than tracing the full
+            # outer boundary -- a bean/motif stitch belongs down the middle
+            # of a thin stroke, not around both of its long edges.
+            rail_a = satin_rungs[0::2]
+            rail_b = satin_rungs[1::2]
+            midline = [((ax + bx) / 2, (ay + by) / 2) for (ax, ay), (bx, by) in zip(rail_a, rail_b)]
+            if thin_treatment == "BEAN":
                 objects.append(
                     EmbroideryObject(
                         id=f"region-{color_index}-{i}",
-                        type=ObjectType.SATIN,
-                        geometry=satin_rungs,
+                        type=ObjectType.BEAN,
+                        geometry=midline,
                         color=color_hex,
-                        stitch_settings=StitchSettings(
-                            density_mm=effective_density_mm,
-                            underlay=_SATIN_UNDERLAY,
-                            pull_compensation_mm=_SATIN_PULL_COMPENSATION_MM,
-                        ),
+                        stitch_settings=StitchSettings(stitch_length_mm=stitch_length_mm),
                         sequence=seq,
                         layer=0,
                     )
@@ -337,28 +407,73 @@ def image_to_design(
                 objects.append(
                     EmbroideryObject(
                         id=f"region-{color_index}-{i}",
-                        type=object_type,
-                        geometry=rings,
+                        type=ObjectType.MOTIF,
+                        geometry=midline,
                         color=color_hex,
-                        stitch_settings=StitchSettings(
-                            stitch_length_mm=stitch_length_mm,
-                            density_mm=effective_density_mm,
-                            angle_deg=angle_deg,
-                            border_width_mm=effective_border_mm,
-                            # Only ever applies to the FILL branch in
-                            # practice -- generate_underlay_stitches already
-                            # no-ops for CROSS_STITCH regardless of this
-                            # value, kept here rather than branched on
-                            # object_type so this object-construction call
-                            # doesn't need its own copy of that type check.
-                            underlay=_FILL_UNDERLAY if object_type == ObjectType.FILL else None,
-                            pull_compensation_mm=_DEFAULT_PULL_COMPENSATION_MM_BY_STYLE[stitch_style],
-                        ),
+                        stitch_settings=StitchSettings(stitch_length_mm=stitch_length_mm),
                         sequence=seq,
                         layer=0,
                     )
                 )
-            seq += 1
+        elif stitch_style == "fill" and is_puff_eligible(rings, total_foreground_area_mm2):
+            objects.append(
+                EmbroideryObject(
+                    id=f"region-{color_index}-{i}",
+                    type=ObjectType.PUFF_3D,
+                    geometry=rings,
+                    color=color_hex,
+                    stitch_settings=StitchSettings(
+                        density_mm=effective_density_mm,
+                        angle_deg=angle_deg,
+                    ),
+                    sequence=seq,
+                    layer=0,
+                )
+            )
+        else:
+            objects.append(
+                EmbroideryObject(
+                    id=f"region-{color_index}-{i}",
+                    type=object_type,
+                    geometry=rings,
+                    color=color_hex,
+                    stitch_settings=StitchSettings(
+                        stitch_length_mm=stitch_length_mm,
+                        density_mm=effective_density_mm,
+                        angle_deg=angle_deg,
+                        border_width_mm=effective_border_mm,
+                        # Only ever applies to the FILL branch in practice --
+                        # generate_underlay_stitches already no-ops for
+                        # CROSS_STITCH regardless of this value, kept here
+                        # rather than branched on object_type so this
+                        # object-construction call doesn't need its own copy
+                        # of that type check.
+                        underlay=_FILL_UNDERLAY if object_type == ObjectType.FILL else None,
+                        pull_compensation_mm=_DEFAULT_PULL_COMPENSATION_MM_BY_STYLE[stitch_style],
+                    ),
+                    sequence=seq,
+                    layer=0,
+                )
+            )
+            if object_type == ObjectType.FILL and len(rings) == 1:
+                applique_candidates.append((len(objects) - 1, rec["area_mm2"]))
+        seq += 1
+
+    # At most one region in the whole design becomes APPLIQUE -- see
+    # _APPLIQUE_MIN_DOMINANT_AREA_FRACTION's docstring above for why this
+    # stays deliberately rare.
+    if applique_candidates and total_foreground_area_mm2 > 0:
+        best_idx, best_area = max(applique_candidates, key=lambda pair: pair[1])
+        if best_area >= total_foreground_area_mm2 * _APPLIQUE_MIN_DOMINANT_AREA_FRACTION:
+            candidate = objects[best_idx]
+            poly = Polygon(candidate.geometry[0])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            hull_area = poly.convex_hull.area
+            convexity = (poly.area / hull_area) if hull_area > 1e-9 else 0.0
+            if convexity >= _APPLIQUE_MIN_CONVEXITY:
+                candidate.type = ObjectType.APPLIQUE
+                candidate.stitch_settings = StitchSettings(border_width_mm=candidate.stitch_settings.border_width_mm)
 
     if not objects:
         raise ValueError(

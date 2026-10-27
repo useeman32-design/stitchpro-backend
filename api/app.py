@@ -125,7 +125,7 @@ def points_to_file():
     Request JSON:
       {
         "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
-                    "command": "jump" | "stitch" | "colorChange" | "end"}, ...],
+                    "command": "jump" | "stitch" | "colorChange" | "stop" | "end"}, ...],
         "colors": ["#RRGGBB", ...],   // optional, one per color block, in order
         "format": "dst" | "pes" | "jef" | "vp3" | "exp",   // default "dst"
         "name": "my-design"            // optional, used for the download filename
@@ -357,8 +357,9 @@ def image_to_points():
       {"width_mm": ..., "height_mm": ...,
        "threads": ["#RRGGBB", ...],
        "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
-                   "command": "jump"|"stitch"|"colorChange"}, ...],
-       "stitchTypeBreakdown": [{"type": "SATIN"|"FILL"|"CROSS_STITCH"|"RUNNING",
+                   "command": "jump"|"stitch"|"colorChange"|"stop"}, ...],
+       "stitchTypeBreakdown": [{"type": "SATIN"|"FILL"|"CROSS_STITCH"|"RUNNING"
+                                 |"BEAN"|"MOTIF"|"PUFF_3D"|"APPLIQUE",
                                  "objectCount": int, "stitchCount": int}, ...],
        "artworkKind": "flat"|"photo"|"flat (forced)",
        "artworkConfidence": 0..1}

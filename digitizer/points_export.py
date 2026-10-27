@@ -71,7 +71,7 @@ def design_to_points(design: EmbroideryDesign) -> dict:
         type_key = obj.type.value
         bucket = type_counts.setdefault(type_key, {"objectCount": 0, "stitchCount": 0})
         bucket["objectCount"] += 1
-        bucket["stitchCount"] += sum(1 for *_xy, is_jump in stitches if not is_jump)
+        bucket["stitchCount"] += sum(1 for *_xy, command in stitches if command == "stitch")
 
         if obj.color != current_color:
             threads.append(obj.color)
@@ -82,12 +82,12 @@ def design_to_points(design: EmbroideryDesign) -> dict:
                 points.append({"x": cx, "y": cy, "command": "colorChange"})
             current_color = obj.color
 
-        for x, y, is_jump in stitches:
+        for x, y, command in stitches:
             points.append(
                 {
                     "x": round((x + offset_x) * 10),
                     "y": round((y + offset_y) * 10),
-                    "command": "jump" if is_jump else "stitch",
+                    "command": command,  # "stitch" | "jump" | "stop" -- see dispatch.py
                 }
             )
             if len(points) > MAX_EXPORT_POINTS:

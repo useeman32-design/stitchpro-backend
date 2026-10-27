@@ -123,6 +123,61 @@ def _oriented_axis(outer_ring_mm: list[Point]) -> tuple[tuple[float, float], tup
     return direction, perpendicular, length_mm, width_mm
 
 
+# Below this oriented-bbox width (mm), a full satin column packs crossing
+# stitches nearly on top of each other for little visual gain over a much
+# cheaper reinforced running stitch -- see pipeline.py's BEAN/MOTIF/SATIN
+# split (new stitch type follow-up: Bean/Motif/3D Puff/Applique).
+DEFAULT_BEAN_MAX_WIDTH_MM = 1.0
+
+# A repeating motif ornament only reads well along a genuinely long
+# band/border, not a short glyph stroke -- see pipeline.py's split.
+DEFAULT_MOTIF_MIN_ELONGATION_RATIO = 10.0
+
+
+def thin_region_treatment(
+    length_mm: float,
+    width_mm: float,
+    bean_max_width_mm: float = DEFAULT_BEAN_MAX_WIDTH_MM,
+    motif_min_elongation_ratio: float = DEFAULT_MOTIF_MIN_ELONGATION_RATIO,
+) -> str:
+    """Given a thin/elongated region's oriented-bbox `(length_mm, width_mm)`
+    (from `oriented_bbox_dims`, only meaningful once `is_satin_eligible` and
+    `generate_satin_rungs_for_thin_region` have both already confirmed this
+    region is a safe, scan-validated candidate for *some* rail-based
+    treatment), decides which of the three real options fits best:
+
+    - `"BEAN"`: hairline-thin (`width_mm <= bean_max_width_mm`) -- too thin
+      for a satin column to earn its stitch count.
+    - `"MOTIF"`: not hairline-thin, but very long relative to its width
+      (`length_mm / width_mm >= motif_min_elongation_ratio`) -- a long
+      decorative band/border reads better as a repeating ornament.
+    - `"SATIN"`: the default/common case -- an ordinary stroke width and
+      elongation (most letterforms, badge border bars).
+    """
+    if width_mm <= bean_max_width_mm:
+        return "BEAN"
+    if width_mm > 0 and length_mm / width_mm >= motif_min_elongation_ratio:
+        return "MOTIF"
+    return "SATIN"
+
+
+def oriented_bbox_dims(outer_ring_mm: list[Point]) -> tuple[float, float] | None:
+    """Public wrapper around `_oriented_axis` exposing just `(length_mm,
+    width_mm)` -- used outside this module by pipeline.py's BEAN/MOTIF/
+    PUFF_3D eligibility heuristics, which all need the same "how long and
+    how wide is this region's minimum-area oriented bounding box" question
+    `is_satin_eligible` already answers internally, without duplicating the
+    oriented-bounding-box geometry math here a second time. Returns `None`
+    for a degenerate ring (same cases `_oriented_axis` itself returns
+    `None` for).
+    """
+    axis = _oriented_axis(outer_ring_mm)
+    if axis is None:
+        return None
+    _direction, _perp, length_mm, width_mm = axis
+    return length_mm, width_mm
+
+
 def is_satin_eligible(
     rings: list[list[Point]],
     max_satin_width_mm: float = DEFAULT_MAX_SATIN_WIDTH_MM,

@@ -20,7 +20,16 @@ class ObjectType(str, Enum):
     SATIN = "SATIN"
     FILL = "FILL"
     CROSS_STITCH = "CROSS_STITCH"
-    # Reserved for later milestones (brief section 8): COLUMN, APPLIQUE, SPECIAL.
+    BEAN = "BEAN"               # reinforced multi-pass running stitch, for
+                                 # hairline-thin strokes (see stitches/bean)
+    MOTIF = "MOTIF"              # repeating decorative shape tiled along a
+                                 # path (see stitches/motif)
+    PUFF_3D = "PUFF_3D"          # satin-style coverage stitched over a foam
+                                 # pad for a raised look (see stitches/puff)
+    APPLIQUE = "APPLIQUE"        # fabric patch sewn on rather than filled
+                                 # with thread (see stitches/applique)
+    # Reserved for later milestones (brief section 8): COLUMN, SPECIAL.
+
 
 
 Point = tuple[float, float]  # (x_mm, y_mm), +y down, matches pyembroidery's convention
@@ -38,7 +47,7 @@ class StitchSettings:
     angle_deg: float = 0.0              # SATIN/FILL/CROSS_STITCH stitch direction
     underlay: str | None = None         # None | "edge_run" | "center_run" | "zigzag"
     pull_compensation_mm: float = 0.0   # SATIN/FILL outward expansion
-    border_width_mm: float = 0.0        # FILL/CROSS_STITCH only: width of a satin
+    border_width_mm: float = 0.0        # FILL/CROSS_STITCH: width of a satin
                                          # "edge walk" column traced around the
                                          # region's outer boundary and every hole,
                                          # stitched on top of the fill/cross-stitch
@@ -47,6 +56,29 @@ class StitchSettings:
                                          # stitches/satin/border.py). 0 = no border
                                          # (back-compat default for callers that
                                          # built a FILL object before this existed).
+                                         # PUFF_3D/APPLIQUE: width of their own
+                                         # finishing satin edge/border (see
+                                         # stitches/puff/generator.py and
+                                         # stitches/applique/generator.py); 0
+                                         # falls back to each generator's own
+                                         # sensible built-in default rather than
+                                         # disabling the border outright, since
+                                         # (unlike FILL/CROSS_STITCH) neither of
+                                         # those two ever looks right with no
+                                         # finishing edge at all.
+    bean_passes: int = 3                 # BEAN only: how many full forward/
+                                         # backward traversals of the same path
+                                         # ("triple stitch" = 3, the classic
+                                         # default; must be >= 1).
+    motif_pattern: str = "diamond"       # MOTIF only: which built-in repeating
+                                         # shape to tile (see
+                                         # stitches/motif/generator.py's
+                                         # MOTIF_PATTERNS for the full list).
+    motif_spacing_mm: float = 4.0        # MOTIF only: center-to-center distance
+                                         # between repeated motifs along the path.
+    motif_scale: float = 1.0             # MOTIF only: size multiplier for each
+                                         # repeated motif shape relative to its
+                                         # nominal (spacing-derived) size.
 
 
 @dataclass

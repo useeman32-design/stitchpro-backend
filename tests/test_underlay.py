@@ -76,7 +76,12 @@ def test_underlay_stitched_before_top_stitch_in_dispatch():
     obj = _satin_obj("center_run")
     combined = generate_object_stitches(obj)
     underlay_only = generate_underlay_stitches(obj)
-    assert combined[: len(underlay_only)] == underlay_only
+    # generate_object_stitches (dispatch.py) returns "stitch"/"jump"/"stop"
+    # command strings, while generate_underlay_stitches' own per-type
+    # generators still return the lower-level bool `is_jump` contract (see
+    # dispatch.py's module docstring) -- normalize before comparing.
+    underlay_as_commands = [(x, y, "jump" if is_jump else "stitch") for x, y, is_jump in underlay_only]
+    assert combined[: len(underlay_only)] == underlay_as_commands
 
 
 RECT = [(0, 0), (30, 0), (30, 20), (0, 20)]

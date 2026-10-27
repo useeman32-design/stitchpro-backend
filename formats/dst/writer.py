@@ -14,6 +14,7 @@ from pyembroidery import (
     END,
     JUMP,
     STITCH,
+    STOP,
     EmbPattern,
     write_dst,
 )
@@ -22,6 +23,16 @@ from digitizer.model import EmbroideryDesign
 from digitizer.routing.router import route_objects
 from digitizer.stitches.dispatch import generate_object_stitches
 from formats.threads import hex_to_thread as _hex_to_thread
+
+# generate_object_stitches' third tuple element is one of these three
+# strings (see digitizer/stitches/dispatch.py) -- "stop" is a real machine
+# pause (PUFF_3D/APPLIQUE only), encoded as pyembroidery's STOP command.
+# At the raw DST byte level STOP and COLOR_CHANGE are the identical 3-byte
+# command (see pyembroidery's own DstWriter) -- what makes ours read as "a
+# stop" rather than a genuine thread change is simply that we never
+# register a new thread for it below, exactly how every commercial
+# digitizing program implements a mid-design pause in this format.
+_CODE_BY_COMMAND = {"stitch": STITCH, "jump": JUMP, "stop": STOP}
 
 
 def compile_design(design: EmbroideryDesign) -> EmbPattern:
@@ -53,8 +64,8 @@ def compile_design(design: EmbroideryDesign) -> EmbPattern:
                 pattern.color_change(0, 0)
             current_color = obj.color
 
-        for x, y, is_jump in stitches:
-            code = JUMP if is_jump else STITCH
+        for x, y, command in stitches:
+            code = _CODE_BY_COMMAND[command]
             pattern.add_stitch_absolute(code, (x + offset_x) * 10, (y + offset_y) * 10)
 
     pattern.add_command(END)

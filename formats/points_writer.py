@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping
 
-from pyembroidery import COLOR_CHANGE, END, JUMP, STITCH, EmbPattern
+from pyembroidery import COLOR_CHANGE, END, JUMP, STITCH, STOP, EmbPattern
 
 from formats.threads import hex_to_thread
 
@@ -35,13 +35,23 @@ _COMMANDS = {
     "jump": JUMP,
     "stitch": STITCH,
     "colorChange": COLOR_CHANGE,
+    # Real machine pause (PUFF_3D/APPLIQUE regions only -- see
+    # digitizer/stitches/dispatch.py and formats/dst/writer.py's STOP
+    # handling for why this is a real command, not simulation-only): a
+    # server-digitized design's points stream (digitizer/points_export.py)
+    # can include "stop" entries, and this is the module that re-compiles
+    # that exact points stream into a real downloadable file (see
+    # stitch-pro's downloadStitchFile.ts / backendClient.ts), so it must
+    # understand the command too, or a Puff/Appliqu\u00e9 design would fail to
+    # download with an "unknown command" error.
+    "stop": STOP,
     "end": END,
 }
 
 
 def compile_points(points: Iterable[Mapping], colors: list[str] | None = None) -> EmbPattern:
     """Build a pyembroidery EmbPattern from an ordered list of
-    {"x": int, "y": int, "command": "jump"|"stitch"|"colorChange"|"end"}
+    {"x": int, "y": int, "command": "jump"|"stitch"|"colorChange"|"stop"|"end"}
     records, already in 0.1mm absolute units (screen-style, +Y down) -- the
     exact convention stitch-pro's own DstPoint/dstWriter.ts uses, and the
     same convention formats/dst/writer.py's compile_design feeds pyembroidery

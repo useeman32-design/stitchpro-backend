@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import math
 
+from digitizer.stitches.satin.generator import generate_satin_stitch
+
 Point = tuple[float, float]
 
 
@@ -151,3 +153,36 @@ def ring_to_satin_rungs(
     rungs.append(first_pair[0])
     rungs.append(first_pair[1])
     return rungs
+
+
+def rings_to_border_satin_stitches(
+    rings: list[list[Point]],
+    border_mm: float,
+    step_mm: float = 1.5,
+    density_mm: float = 0.4,
+) -> list[tuple[float, float, bool]]:
+    """Independent closed satin loop traced around every ring in `rings`
+    (index 0 = outer boundary, 1: = holes), `border_mm` wide, as `(x, y,
+    is_jump)` triples -- one disconnected loop per ring, so holes get their
+    own clean inner edge instead of being joined to the outer border by a
+    visible long jump (see `ring_to_satin_rungs`'s docstring for why).
+
+    Factored out of dispatch.py's original FILL/CROSS_STITCH-only
+    `_border_stitches` helper so the exact same "trace a clean satin line
+    along this shape's real vector boundary" technique can be reused by
+    PUFF_3D's foam edge cap and APPLIQUE's raw-edge-covering border
+    (stitches/puff/generator.py, stitches/applique/generator.py) without
+    duplicating this loop in three places. Returns `[]` if `border_mm <= 0`
+    (0 = no border, same convention `StitchSettings.border_width_mm`
+    already uses for FILL/CROSS_STITCH).
+    """
+    if border_mm <= 0:
+        return []
+    out: list[tuple[float, float, bool]] = []
+    for ring in rings:
+        rungs = ring_to_satin_rungs(ring, border_mm, step_mm=step_mm)
+        if len(rungs) < 4:
+            continue
+        points = generate_satin_stitch(rungs, density_mm=density_mm)
+        out.extend((x, y, i == 0) for i, (x, y) in enumerate(points))
+    return out

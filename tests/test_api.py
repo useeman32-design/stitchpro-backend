@@ -155,3 +155,70 @@ class TestImageToFile:
         resp = client.post("/api/design/image-to-file", data=data, content_type="multipart/form-data")
         assert resp.status_code == 200
         assert len(resp.data) > 0
+
+
+def _puff_candidate_png_bytes() -> bytes:
+    """A bold, blocky, moderate-size, non-dominant rounded shape -- real
+    `image_to_design` heuristics (digitizer/stitches/puff/eligibility.py)
+    classify this as PUFF_3D, same shape used by
+    tests/test_new_stitch_types_pipeline.py's own PUFF scenario."""
+    img = Image.new("RGB", (210, 70), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([5, 10, 60, 60], radius=8, fill=(10, 10, 10))
+    d.rounded_rectangle([75, 10, 130, 60], radius=8, fill=(30, 30, 200))
+    d.rounded_rectangle([145, 10, 200, 60], radius=8, fill=(30, 160, 30))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestNewStitchTypesRealDownloadFlow:
+    """New stitch type follow-up (Bean/Motif/3D Puff/Applique): the exact
+    real-world flow stitch-pro's frontend uses (confirmed in
+    src/utils/downloadStitchFile.ts / backendClient.ts) -- fetch a server-
+    digitized design's point stream from /image-to-points, then feed those
+    *exact* points into /points-to-file to get the real downloadable file.
+    A PUFF_3D/APPLIQUE region's "stop" command must survive this whole
+    round trip, or a real design containing one would fail to download.
+    """
+
+    def test_puff_design_points_stream_includes_a_real_stop_command(self):
+        client = _client()
+        data = {
+            "image": (io.BytesIO(_puff_candidate_png_bytes()), "badge.png"),
+            "width_mm": "60",
+            "height_mm": "20",
+        }
+        resp = client.post("/api/design/image-to-points", data=data, content_type="multipart/form-data")
+        assert resp.status_code == 200
+        body = resp.get_json()
+        commands = {p["command"] for p in body["points"]}
+        assert "stop" in commands
+        breakdown_types = {entry["type"] for entry in body["stitchTypeBreakdown"]}
+        assert "PUFF_3D" in breakdown_types
+
+    def test_puff_design_points_stream_downloads_as_a_real_dst_file(self):
+        client = _client()
+        points_data = {
+            "image": (io.BytesIO(_puff_candidate_png_bytes()), "badge.png"),
+            "width_mm": "60",
+            "height_mm": "20",
+        }
+        points_resp = client.post(
+            "/api/design/image-to-points", data=points_data, content_type="multipart/form-data"
+        )
+        assert points_resp.status_code == 200
+        body = points_resp.get_json()
+        assert "stop" in {p["command"] for p in body["points"]}
+
+        download_resp = client.post(
+            "/api/design/points-to-file",
+            json={"points": body["points"], "colors": body["threads"], "format": "dst", "name": "badge"},
+        )
+        assert download_resp.status_code == 200
+        assert len(download_resp.data) > 0
+
+        from pyembroidery import read_dst
+
+        pattern = read_dst(io.BytesIO(download_resp.data))
+        assert len(pattern.stitches) > 0
