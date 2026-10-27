@@ -33,9 +33,26 @@ MAX_EXPORT_POINTS = 250_000  # matches formats/points_writer.py's own sanity cap
 
 def design_to_points(design: EmbroideryDesign) -> dict:
     """Returns `{"width_mm", "height_mm", "threads": [hex, ...], "points":
-    [{"x", "y", "command"}, ...]}` -- `threads[0]` is the color in effect
-    before the first `colorChange` point, `threads[1]` after the first one,
-    and so on, exactly matching `points_to_file`'s own `colors` contract.
+    [{"x", "y", "command"}, ...], "stitchTypeBreakdown": [...]}` --
+    `threads[0]` is the color in effect before the first `colorChange`
+    point, `threads[1]` after the first one, and so on, exactly matching
+    `points_to_file`'s own `colors` contract.
+
+    `stitchTypeBreakdown` is purely informational metadata, *not* part of
+    the `points` stream itself -- deliberately kept out of the point/command
+    contract that `dstPoints` ultimately feeds into real DST/DSB file
+    export (see stitch-pro's downloadStitchFile), so a client that doesn't
+    know about it can safely ignore it with zero risk to the actual
+    machine-readable output. It answers "which stitch types does this
+    design actually use, and how much of it is each" -- e.g. a design is
+    rarely pure FILL or pure SATIN; the auto-digitizer already classifies
+    each region independently (thin_region.py), splitting a single color's
+    regions across FILL/SATIN/CROSS_STITCH as appropriate per-shape, so a
+    client wanting to show the user "this design automatically uses N
+    stitch types across its regions" needs a different signal than the
+    flat point stream to do it. Returned as a list (not a dict) ordered by
+    descending stitch count, so a client can render "SATIN · 4 regions"
+    chips in a sensible dominant-type-first order without re-sorting.
     """
     offset_x = -design.width_mm / 2
     offset_y = -design.height_mm / 2
@@ -44,11 +61,17 @@ def design_to_points(design: EmbroideryDesign) -> dict:
     threads: list[str] = []
     points: list[dict] = []
     current_color: str | None = None
+    type_counts: dict[str, dict[str, int]] = {}
 
     for obj in objects:
         stitches = generate_object_stitches(obj)
         if not stitches:
             continue
+
+        type_key = obj.type.value
+        bucket = type_counts.setdefault(type_key, {"objectCount": 0, "stitchCount": 0})
+        bucket["objectCount"] += 1
+        bucket["stitchCount"] += sum(1 for *_xy, is_jump in stitches if not is_jump)
 
         if obj.color != current_color:
             threads.append(obj.color)
@@ -73,9 +96,15 @@ def design_to_points(design: EmbroideryDesign) -> dict:
     if not points:
         raise ValueError("design has no stitches to export")
 
+    stitch_type_breakdown = [
+        {"type": type_key, "objectCount": counts["objectCount"], "stitchCount": counts["stitchCount"]}
+        for type_key, counts in sorted(type_counts.items(), key=lambda kv: -kv[1]["stitchCount"])
+    ]
+
     return {
         "width_mm": design.width_mm,
         "height_mm": design.height_mm,
         "threads": threads,
         "points": points,
+        "stitchTypeBreakdown": stitch_type_breakdown,
     }

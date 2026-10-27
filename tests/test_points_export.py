@@ -30,11 +30,49 @@ def _rect_design(color="#112233"):
 class TestDesignToPoints:
     def test_basic_shape_returns_expected_keys(self):
         result = design_to_points(_rect_design())
-        assert set(result.keys()) == {"width_mm", "height_mm", "threads", "points"}
+        assert set(result.keys()) == {"width_mm", "height_mm", "threads", "points", "stitchTypeBreakdown"}
         assert result["width_mm"] == 40
         assert result["height_mm"] == 40
         assert result["threads"] == ["#112233"]
         assert len(result["points"]) > 0
+
+    def test_stitch_type_breakdown_for_single_object(self):
+        result = design_to_points(_rect_design())
+        assert result["stitchTypeBreakdown"] == [
+            {"type": "RUNNING", "objectCount": 1, "stitchCount": len(
+                [p for p in result["points"] if p["command"] == "stitch"]
+            )}
+        ]
+
+    def test_stitch_type_breakdown_splits_by_object_type_and_sorts_by_stitch_count(self):
+        # A FILL region (many stitches) and a SATIN region (few) of
+        # different colors -- breakdown must report both, grouped by type
+        # (not by object or color), with the higher-stitch-count type
+        # first regardless of object insertion order.
+        satin_rungs = [(0, 0), (0, 2), (1, 0), (1, 2), (2, 0), (2, 2)]
+        fill_ring = [[(10, 10), (30, 10), (30, 30), (10, 30)]]
+        design = EmbroideryDesign(
+            width_mm=50,
+            height_mm=50,
+            objects=[
+                EmbroideryObject(
+                    id="satin-thin", type=ObjectType.SATIN, geometry=satin_rungs, color="#111111",
+                    stitch_settings=StitchSettings(density_mm=0.4), sequence=0,
+                ),
+                EmbroideryObject(
+                    id="fill-block", type=ObjectType.FILL, geometry=fill_ring, color="#222222",
+                    stitch_settings=StitchSettings(stitch_length_mm=3.0, density_mm=0.4), sequence=1,
+                ),
+            ],
+            threads=["#111111", "#222222"],
+        )
+        result = design_to_points(design)
+        types = [entry["type"] for entry in result["stitchTypeBreakdown"]]
+        assert set(types) == {"SATIN", "FILL"}
+        assert types[0] == "FILL"  # the larger region has more stitches, so it sorts first
+        for entry in result["stitchTypeBreakdown"]:
+            assert entry["objectCount"] == 1
+            assert entry["stitchCount"] > 0
 
     def test_points_have_expected_shape(self):
         result = design_to_points(_rect_design())

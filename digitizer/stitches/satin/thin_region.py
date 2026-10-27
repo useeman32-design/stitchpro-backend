@@ -174,6 +174,20 @@ def _as_line_segments(geom, min_len: float = _MIN_SEGMENT_LEN_MM) -> list[tuple[
     return segments
 
 
+# Scan positions within this fraction of either end of the shape's long
+# axis are allowed to come back with *zero* clean crossings without
+# bailing out the whole region -- a real stroke fragment often tapers to a
+# near-zero-width point or a single vertex right at its tip (e.g. a
+# diamond/lozenge-shaped sliver, or the pointed end of a serif), and a scan
+# line landing exactly on or past that tip legitimately finds nothing to
+# cross. Skipping just that rung (rather than rejecting the entire region)
+# is safe here specifically because it's bounded to the very ends of the
+# scan range; a zero-crossing scan line anywhere in the *middle* of the
+# shape still means something unexpected (a gap, a hole slipping past the
+# single-ring check) and keeps bailing out below.
+_EDGE_TAPER_FRACTION = 0.15
+
+
 def generate_satin_rungs_for_thin_region(
     outer_ring_mm: list[Point],
     step_mm: float = DEFAULT_STEP_MM,
@@ -184,10 +198,12 @@ def generate_satin_rungs_for_thin_region(
     axis at `step_mm` intervals.
 
     Returns `None` (meaning: not safe to treat as one satin column, caller
-    should fall back to FILL) whenever any scan line's intersection with
-    the polygon isn't exactly one clean sub-segment -- see module docstring
-    for why this conservative bail-out is the right trade-off instead of
-    guessing at an ambiguous or self-crossing column.
+    should fall back to FILL) whenever a scan line's intersection with the
+    polygon is ambiguous (more than one sub-segment) anywhere, or comes back
+    empty somewhere other than the shape's own tapering tips (see
+    `_EDGE_TAPER_FRACTION` above) -- see module docstring for why this
+    conservative bail-out is the right trade-off instead of guessing at an
+    ambiguous or self-crossing column.
     """
     if step_mm <= 0:
         raise ValueError("step_mm must be > 0")
@@ -223,13 +239,18 @@ def generate_satin_rungs_for_thin_region(
         return (t * dx + s * px, t * dy + s * py)
 
     n_steps = max(2, math.ceil(span / step_mm))
+    edge_steps = max(1, round(n_steps * _EDGE_TAPER_FRACTION))
     rungs: list[Point] = []
     for k in range(n_steps + 1):
         t = t_min + span * k / n_steps
         scan_line = LineString([point_at(t, s_mid - s_half), point_at(t, s_mid + s_half)])
         segments = _as_line_segments(poly.intersection(scan_line))
+        if len(segments) == 0:
+            if k <= edge_steps or k >= n_steps - edge_steps:
+                continue  # tapering tip -- skip this rung, not a bail-out
+            return None  # unexpected gap mid-shape -- bail
         if len(segments) != 1:
-            return None  # no clean crossing, or more than one -- bail
+            return None  # ambiguous/self-crossing -- bail
         a_pt, b_pt = segments[0]
         # Order consistently along the perpendicular axis so rail A/rail B
         # never swap sides from one rung to the next (which would twist the
@@ -244,3 +265,4 @@ def generate_satin_rungs_for_thin_region(
     if len(rungs) < 4:
         return None
     return rungs
+

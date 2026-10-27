@@ -74,6 +74,39 @@ SLIC-style segmentation or a proper boundary-tracing + curve-fitting
 library), which is a substantially larger scope than this bug-fix pass --
 flagged here as a candidate follow-up, not attempted in this pass.
 
+## Follow-up: automatic per-region stitch type (SATIN vs FILL) was silently not firing
+
+A separate, unrelated-looking bug was found while verifying this benchmark's
+output is used correctly downstream: `digitizer/stitches/satin/thin_region.py`
+already had an automatic per-region classifier (thin/elongated regions like
+glyph strokes and border bars get a real SATIN column instead of a sparse
+tatami FILL), wired into `pipeline.py` since before this benchmark pass. On
+real photo-pipeline output, though, it was firing on **0 of 119**
+geometrically-eligible regions in `wordmark-text.jpg` -- every single one
+bailed back out to FILL. The cause: its scan-line validation treated a scan
+line landing exactly on a shape's own tapering tip (zero clean crossings
+there) the same as an ambiguous or gapped shape, rejecting the whole region
+instead of just skipping that one end rung. Real despeckled/fragmented
+stroke pieces from a photo almost always taper to a point at both ends, so
+this hit nearly every candidate region.
+
+Fixed by allowing zero-crossing scan lines within the first/last 15% of a
+region's long axis (its tapering tips) to be skipped rather than bailing,
+while a zero-crossing or ambiguous (>1 segment) scan line anywhere else
+still safely bails to FILL as before (see `_EDGE_TAPER_FRACTION` in
+`thin_region.py`). Re-running the 8-asset benchmark after the fix: total
+object count is unchanged (1845, zero regions gained or lost -- this is a
+pure reclassification, not a different segmentation), but every single
+asset now has a real SATIN/FILL mix instead of being 100% (or 99.7%) FILL,
+e.g. `wordmark-text.jpg` went from `{FILL: 465}` to `{FILL: 353, SATIN:
+112}`, `monogram-m.jpg` from `{FILL: 310, SATIN: 1}` to `{FILL: 230, SATIN:
+81}`. Visually re-rendered several assets end to end to confirm the new
+SATIN columns look like clean directional stitching, not broken/self-
+crossing output. New regression tests lock in both the tapering-tip fix
+(`test_tapering_lozenge_produces_valid_rungs_instead_of_bailing`) and that
+genuinely ambiguous bent shapes still safely bail
+(`test_bent_bracket_shape_safely_bails_to_none`).
+
 ## Re-running this benchmark
 
 ```

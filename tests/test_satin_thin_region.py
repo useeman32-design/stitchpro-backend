@@ -56,6 +56,17 @@ def _ring_with_hole():
     return [outer, hole]
 
 
+def _lozenge(length=20.0, half_width=2.0):
+    """A thin diamond/lozenge that tapers to an actual point at both ends
+    of its long axis -- exactly the shape a jagged, despeckled glyph-stroke
+    fragment from a real photo-pipeline digitize often collapses to (see
+    the regression this guards: a scan line landing exactly on or past a
+    tapering tip legitimately finds zero crossings there, and that must
+    skip just that one rung rather than reject the whole region)."""
+    mid = length / 2
+    return [(0, 0), (mid, half_width), (length, 0), (mid, -half_width)]
+
+
 def _horseshoe():
     """A tightly curved "C"-like shape: a thick ring with a wedge cut out of
     one side. A straight perpendicular scan along any single global axis
@@ -153,3 +164,32 @@ class TestGenerateSatinRungsForThinRegion:
         # degenerate single-rung "column".
         tiny = [(0, 0), (0.3, 0), (0.3, 0.3), (0, 0.3)]
         assert generate_satin_rungs_for_thin_region(tiny, step_mm=1.0) is None
+
+    def test_tapering_lozenge_produces_valid_rungs_instead_of_bailing(self):
+        # Regression test for a real production bug: a scan line landing
+        # exactly on (or past) a shape's tapering tip finds zero clean
+        # crossings there, which used to bail the *entire* region out to
+        # FILL even though every other scan line along its length was
+        # perfectly clean. Benchmarking against real photo-pipeline output
+        # showed this made the SATIN classifier fire on 0 of 119
+        # geometrically-eligible regions in a real text/line-art asset --
+        # it must now skip just the tapering end rungs and still produce a
+        # valid column.
+        rungs = generate_satin_rungs_for_thin_region(_lozenge(length=20.0, half_width=2.0))
+        assert rungs is not None
+        assert len(rungs) >= 4
+        assert len(rungs) % 2 == 0
+        stitches = generate_satin_stitch(rungs, density_mm=0.4)
+        assert len(stitches) > 10
+        for x, y in stitches:
+            assert -0.5 <= x <= 20.5
+            assert -2.5 <= y <= 2.5
+
+    def test_bent_bracket_shape_safely_bails_to_none(self):
+        # A sharply bent (L-shaped) thin bar has no single global axis that
+        # cleanly covers both arms -- whatever the exact reason (not
+        # eligible at all, or an ambiguous/gapped scan partway along), the
+        # safety guarantee holds: it must never come back as a broken or
+        # self-crossing satin column.
+        bent = [(0, 0), (30, 0), (30, 2), (2, 2), (2, 30), (0, 30)]
+        assert generate_satin_rungs_for_thin_region(bent) is None

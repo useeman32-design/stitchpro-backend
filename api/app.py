@@ -358,8 +358,19 @@ def image_to_points():
        "threads": ["#RRGGBB", ...],
        "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
                    "command": "jump"|"stitch"|"colorChange"}, ...],
+       "stitchTypeBreakdown": [{"type": "SATIN"|"FILL"|"CROSS_STITCH"|"RUNNING",
+                                 "objectCount": int, "stitchCount": int}, ...],
        "artworkKind": "flat"|"photo"|"flat (forced)",
        "artworkConfidence": 0..1}
+
+    `stitchTypeBreakdown` is purely informational (see
+    digitizer/points_export.py's docstring) -- the auto-digitizer already
+    classifies each region independently (thin_region.py decides FILL vs
+    SATIN per-shape, e.g. thin strokes vs large fills), so a single design
+    routinely mixes stitch types across its regions; this tells a client
+    which types ended up used and how much of the design is each, sorted
+    by descending stitch count, without needing to parse per-object detail
+    out of the flat `points` stream.
 
     `artworkKind`/`artworkConfidence` come straight from
     `classify_artwork`/`auto_vectorize` (digitizer/pipeline.py) -- purely
