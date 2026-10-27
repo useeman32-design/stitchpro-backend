@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw
 
-from digitizer.segmentation.color_quantize import BACKGROUND_LABEL, build_label_grid
+from digitizer.segmentation.color_quantize import BACKGROUND_LABEL, build_label_grid, despeckle_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
 
 
@@ -251,3 +251,48 @@ class TestLabelGridToRingGroups:
         ys = [p[1] for p in outer]
         assert max(xs) <= 20.0 + 1e-6  # 10px * 2.0mm/px
         assert max(ys) <= 30.0 + 1e-6  # 10px * 3.0mm/px
+
+
+class TestDespeckleLabelGrid:
+    def test_isolated_single_pixel_speckle_absorbed_into_surrounding_label(self):
+        grid = [[0] * 10 for _ in range(10)]
+        grid[5][5] = 1  # a single rogue pixel of a different label
+        out = despeckle_label_grid(grid, min_component_px=4)
+        assert out[5][5] == 0
+
+    def test_large_region_is_left_untouched(self):
+        grid = [[0] * 10 for _ in range(10)]
+        for y in range(2, 8):
+            for x in range(2, 8):
+                grid[y][x] = 1
+        out = despeckle_label_grid(grid, min_component_px=4)
+        for y in range(2, 8):
+            for x in range(2, 8):
+                assert out[y][x] == 1
+
+    def test_small_component_absorbed_into_majority_neighbor(self):
+        # A 2x2 speckle of label 2 sitting entirely inside a sea of label 1
+        # (itself inside label 0) should be absorbed into 1, the label
+        # actually touching all of its border.
+        grid = [[0] * 10 for _ in range(10)]
+        for y in range(1, 9):
+            for x in range(1, 9):
+                grid[y][x] = 1
+        grid[4][4] = 2
+        grid[4][5] = 2
+        grid[5][4] = 2
+        grid[5][5] = 2
+        out = despeckle_label_grid(grid, min_component_px=5)
+        assert out[4][4] == 1 and out[5][5] == 1
+
+    def test_empty_grid_does_not_crash(self):
+        assert despeckle_label_grid([]) == []
+
+    def test_background_label_participates_like_any_other_label(self):
+        grid = [[BACKGROUND_LABEL] * 10 for _ in range(10)]
+        for y in range(2, 8):
+            for x in range(2, 8):
+                grid[y][x] = 0
+        grid[4][4] = BACKGROUND_LABEL  # tiny bg speck inside the foreground
+        out = despeckle_label_grid(grid, min_component_px=4)
+        assert out[4][4] == 0

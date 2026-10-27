@@ -57,7 +57,7 @@ from digitizer.classifier.classify_artwork import classify_artwork
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
 from digitizer.segmentation.artworkify import artworkify
 from digitizer.segmentation.background_removal import compute_background_mask
-from digitizer.segmentation.color_quantize import build_label_grid
+from digitizer.segmentation.color_quantize import build_label_grid, despeckle_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
 from digitizer.stitches.satin.thin_region import (
     generate_satin_rungs_for_thin_region,
@@ -70,9 +70,19 @@ from digitizer.stitches.satin.thin_region import (
 # the ordinary default (12.0, tuned for a single solid background color)
 # reliably collapses a photographed design's genuinely distinct colors down
 # to one once the background itself carries a dozen-plus gradient reference
-# shades, and why a small-but-nonzero value (rather than disabling the rule
-# outright) is the correct fix.
-_PHOTO_BACKGROUND_BLEND_TOLERANCE = 2.0
+# shades. 0.0 (fully disabling this specific merge rule, rather than just
+# tightening it) was chosen only after benchmarking across this project's
+# full 8-asset demo library (see session notes): a small-but-nonzero value
+# like 2.0 looked sufficient on an initial handful of test images, but
+# still silently collapsed monogram-m.jpg's subtler color distinctions down
+# to a single color. 0.0 was the only value confirmed to preserve the full
+# expected color count on all 8 assets. This is safe specifically *because*
+# `artworkify`'s posterize step already does the anti-aliasing cleanup rule
+# 2 exists for (collapsing a smooth AA gradient down to a handful of flat
+# posterize levels before quantization ever runs), so rule 2's extra
+# cross-color blend-line check is largely redundant for already-artworkified
+# input, not just safe to loosen.
+_PHOTO_BACKGROUND_BLEND_TOLERANCE = 0.0
 
 
 # Default resolution for the standalone background-removal *preview*
@@ -272,6 +282,15 @@ def image_to_design(
         remove_background=remove_background,
         **label_grid_kwargs,
     )
+    if artwork_kind == "photo":
+        # Collapses the dozens of tiny texture-noise islands a close-up
+        # photo's per-thread shading leaves behind (even after artworkify's
+        # denoise+posterize) into their surrounding real region, instead of
+        # each becoming its own near-useless stitch object -- see
+        # despeckle_label_grid's own docstring for why this is a different
+        # (and necessary, in addition to) fix from label_grid_to_ring_groups'
+        # own min_area_px/min_bbox_mm filters below.
+        label_grid = despeckle_label_grid(label_grid)
 
     object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
 

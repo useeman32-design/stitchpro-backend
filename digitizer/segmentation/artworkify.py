@@ -65,30 +65,42 @@ from PIL import Image, ImageFilter, ImageOps
 # Posterize bit depth: 4 bits/channel = 16 levels/channel, 4096 possible
 # colors -- enough headroom for a design to have several genuinely
 # distinct flat colors while still being aggressive enough to break
-# photographic gradients into separable steps. Tested against this
-# project's own photographed sample assets (see session notes): 5 bits
-# (32 levels) was not aggressive enough to stop the blend-line merge from
-# still collapsing distinct colors; 3 bits (8 levels) started visibly
-# banding genuinely smooth, intentional color transitions (e.g. a
-# realistic fur/gradient fill some logos deliberately use). 4 is the
-# measured sweet spot.
+# photographic gradients into separable steps. Benchmarked end-to-end
+# (the real `image_to_design` pipeline, counting actual surviving
+# `design.threads` -- not a palette-size proxy, which was tried first and
+# gave misleadingly optimistic numbers, see session notes) across this
+# project's full 8-asset photographed demo library: 4 is the largest
+# value confirmed to never cost a single real color on any of the 8
+# assets. 3 bits (8 levels) looked like a big win on a raw-palette-size
+# proxy metric, but actually *lost* a real color outright on two separate
+# assets once measured against real surviving threads -- a 3-bit test
+# that looked like a pure improvement was actually trading accuracy for a
+# smaller stitch-object count, which this project's standing
+# accuracy-first priority rules out. 2 bits (4 levels) is more obviously
+# too aggressive (drops monogram-m.jpg to 4 colors and cap-logo.jpg to a
+# single color even on the flawed proxy metric). 4 is the correct,
+# measured, accuracy-preserving choice; the remaining texture-driven
+# object-count fragmentation on the busiest photos is handled separately,
+# after quantization, by `color_quantize.despeckle_label_grid`.
 POSTERIZE_BITS = 4
 
 # Median filter kernel size (odd, pixels) for the pre-posterize denoise
-# pass, applied at the image's *own* resolution. Raised from an initial 3
-# to 7 after measuring on this project's own photographed sample assets
-# (see session notes): 3 was large enough to kill single-pixel JPEG noise
-# but left individual embroidery *thread strands* -- each with their own
-# highlight/shadow a close-up product photo resolves clearly -- as their
-# own tiny, disconnected posterized islands, very nearly doubling the
-# final stitch object count for no accuracy benefit (805 vs. 424 objects
-# on the same test image, with no loss in overall shape/color
-# recognizability). 7 is still well short of blurring across an actual
-# region boundary (a design's real features are many pixels across at
-# this pipeline's working resolution), it just stops resolving
-# individual-thread-level texture that was never going to be reproduced
-# as individual stitches anyway.
-_DENOISE_KERNEL = 7
+# pass, applied at the image's *own* resolution -- deliberately small so
+# it only removes sub-region noise, never blurs across an actual design
+# boundary. A larger kernel (5-9) was tried to cut down on small
+# disconnected texture-level fragments surviving posterization (e.g. a
+# close-up lion-patch photo's individual fur highlights/shadows each
+# becoming their own tiny region), and it does help that one case --
+# but benchmarked across this project's full 8-asset demo library (see
+# session notes), a kernel above 3 also blurs away several *genuinely*
+# distinct, subtle foreground colors on other designs (monogram-m.jpg and
+# cap-logo.jpg both lost real colors, down to as few as 1, at kernel=7) --
+# i.e. it trades away the exact color-fidelity fix this module exists for.
+# 3 is the largest kernel that was confirmed to never cost real colors on
+# any of the 8 assets. The residual micro-texture fragmentation this
+# leaves behind is a separate, lower-priority stitch-efficiency polish
+# item (more small FILL objects/trims than ideal), not a correctness bug.
+_DENOISE_KERNEL = 3
 
 _CONTRAST_LOW_PERCENTILE = 2.0
 _CONTRAST_HIGH_PERCENTILE = 98.0
