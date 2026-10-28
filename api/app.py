@@ -33,6 +33,15 @@ server-side digitizing milestones (satin, fill, real segmentation).
                                         (digitizer/pipeline.py), unlike the
                                         two routes above which only compile
                                         an already-digitized plan.
+  POST /api/design/text-to-file     -> Dedicated embroidery lettering
+                                        engine (digitizer/lettering):
+                                        builds real satin-column
+                                        letterforms directly from typed
+                                        text, no image/classification step
+                                        at all. See its own docstring.
+  POST /api/design/text-to-points   -> Same lettering engine as above, JSON
+                                        point-stream response for preview
+                                        rendering (matches image-to-points).
 """
 
 from __future__ import annotations
@@ -45,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import Flask, Response, jsonify, request, send_file
 
+from digitizer.lettering.alphabet_block import glyph_for, is_fully_supported
+from digitizer.lettering.engine import build_text_design
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
 from digitizer.pipeline import (
     MAX_MAX_DIM,
@@ -393,6 +404,150 @@ def image_to_points():
 
     result["artworkKind"] = design.metadata.get("artwork_kind")
     result["artworkConfidence"] = design.metadata.get("artwork_confidence")
+    return jsonify(result)
+
+
+def _build_text_design_from_request() -> tuple[EmbroideryDesign | None, tuple | None]:
+    """Shared request parsing for both text-to-file and text-to-points:
+    validates the JSON body, builds a real EmbroideryDesign via the
+    dedicated lettering engine (digitizer/lettering/engine.py -- satin-
+    column letterforms, NOT the generic photo/artwork auto-digitizer), and
+    returns either `(design, None)` on success or `(None, (response,
+    status))` on a validation/engine error."""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return None, (jsonify({"error": "request body must be a JSON object"}), 400)
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, (jsonify({"error": "'text' must be a non-empty string"}), 400)
+
+    try:
+        size_mm = float(body.get("size_mm", 20))
+    except (TypeError, ValueError):
+        return None, (jsonify({"error": "'size_mm' must be a number"}), 400)
+    if not (3 <= size_mm <= 200):
+        return None, (jsonify({"error": "'size_mm' must be between 3 and 200"}), 400)
+
+    color = str(body.get("color") or "#111111")
+    layout = str(body.get("layout") or "straight")
+
+    if not is_fully_supported(text):
+        unsupported = sorted({ch for ch in text if glyph_for(ch) is None})
+        return None, (
+            jsonify(
+                {
+                    "error": "text contains characters the dedicated lettering engine doesn't support yet",
+                    "unsupportedCharacters": unsupported,
+                }
+            ),
+            422,
+        )
+
+    try:
+        design = build_text_design(text, size_mm=size_mm, color=color, layout=layout)
+    except ValueError as e:
+        return None, (jsonify({"error": str(e)}), 400)
+
+    return design, None
+
+
+@app.post("/api/design/text-to-file")
+def text_to_file():
+    """
+    Real embroidery lettering, built from a dedicated satin-column
+    alphabet (digitizer/lettering -- see its module docstrings for why
+    this is a separate path from /api/design/image-to-file's generic
+    photo/artwork auto-digitizer): every letter becomes a proper
+    monoline-skeleton-derived satin column, including clean curves on
+    letters like O/S/C/G, instead of whatever FILL/SATIN mix the generic
+    per-region classifier would land on for a rasterized text image.
+
+    Request JSON:
+      {
+        "text": "STITCHPRO",       // required; only characters in
+                                    // digitizer/lettering/alphabet_block.py's
+                                    // GLYPHS table are supported (A-Z,
+                                    // 0-9, space, and a handful of common
+                                    // punctuation) -- a 422 response lists
+                                    // which characters aren't supported so
+                                    // the caller can fall back to the
+                                    // generic render-and-auto-digitize path
+                                    // for this string.
+        "size_mm": 20,              // optional, default 20 -- cap height
+                                    // in mm, 3-200.
+        "color": "#111111",         // optional hex thread color.
+        "layout": "straight",       // optional, only "straight" is
+                                    // supported so far -- "arc_up"/
+                                    // "arc_down" still need the generic
+                                    // pipeline (see engine.py docstring).
+        "format": "dst",            // optional, one of SUPPORTED_FORMATS.
+        "name": "my-text-design"    // optional, download filename.
+      }
+
+    Returns the file as a binary attachment download on success, a 422
+    with {"error": ..., "unsupportedCharacters": [...]} if the text uses a
+    character outside the Bold Block alphabet, or a 400 for any other
+    malformed request.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    fmt = str(body.get("format", "dst")).lower()
+    if fmt not in SUPPORTED_FORMATS:
+        return jsonify({"error": f"unsupported format {fmt!r}", "supported": list(SUPPORTED_FORMATS)}), 400
+
+    design, err = _build_text_design_from_request()
+    if err is not None:
+        return err
+
+    name = str(body.get("name") or "text-design")
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "text-design"
+
+    try:
+        file_bytes = design_to_format_bytes(design, fmt)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return send_file(
+        io.BytesIO(file_bytes),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=f"{safe_name}.{fmt}",
+    )
+
+
+@app.post("/api/design/text-to-points")
+def text_to_points():
+    """
+    Same dedicated lettering engine as /api/design/text-to-file, but
+    returns the plain JSON point-stream contract (digitizer/points_export.py)
+    instead of a binary file -- for client-side preview rendering (e.g.
+    stitch-pro's live text-design preview / Simulator), matching
+    /api/design/image-to-points' response shape.
+
+    Request JSON: same fields as /api/design/text-to-file except no
+    `format`/`name` (those only make sense for a file download).
+
+    Response JSON on success:
+      {"width_mm": ..., "height_mm": ...,
+       "threads": ["#RRGGBB", ...],
+       "points": [{"x": <0.1mm int>, "y": <0.1mm int>,
+                   "command": "jump"|"stitch"|"colorChange"}, ...],
+       "stitchTypeBreakdown": [{"type": "SATIN", "objectCount": int,
+                                 "stitchCount": int}]}
+
+    Or a 422 with {"error": ..., "unsupportedCharacters": [...]} if the
+    text uses a character outside the Bold Block alphabet, or a 400 for
+    any other malformed request.
+    """
+    design, err = _build_text_design_from_request()
+    if err is not None:
+        return err
+
+    try:
+        result = design_to_points(design)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
     return jsonify(result)
 
 
