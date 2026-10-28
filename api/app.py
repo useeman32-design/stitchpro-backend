@@ -42,11 +42,33 @@ server-side digitizing milestones (satin, fill, real segmentation).
   POST /api/design/text-to-points   -> Same lettering engine as above, JSON
                                         point-stream response for preview
                                         rendering (matches image-to-points).
+  POST /api/design/vectorize        -> Real editable-vector pipeline: runs
+                                        classification/background-removal/
+                                        quantization/raster-to-polygon
+                                        tracing (everything image-to-* does,
+                                        up to but not including stitch
+                                        generation) and returns the traced
+                                        regions as plain JSON vector shapes,
+                                        for a client to let the user review/
+                                        edit (select, delete, redraw) before
+                                        any stitches are generated. Also
+                                        accepts manual background-mask
+                                        correction brush strokes.
+  POST /api/design/regions-to-points -> Builds a real digitized design from
+                                        a (possibly user-edited) region list
+                                        -- normally /api/design/vectorize's
+                                        own output -- and returns the same
+                                        JSON point-stream contract as
+                                        /api/design/image-to-points.
+  POST /api/design/regions-to-file  -> Same as regions-to-points but
+                                        returns a real machine file, like
+                                        /api/design/image-to-file.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -64,7 +86,9 @@ from digitizer.pipeline import (
     PREVIEW_MAX_MAX_DIM,
     PREVIEW_MIN_MAX_DIM,
     STITCH_STYLES,
+    design_from_region_records,
     image_to_design,
+    image_to_vector_regions,
     remove_background_preview,
 )
 from digitizer.points_export import design_to_points
@@ -604,6 +628,272 @@ def remove_background():
         return jsonify({"error": str(e)}), 400
 
     return send_file(io.BytesIO(png_bytes), mimetype="image/png")
+
+
+@app.post("/api/design/vectorize")
+def vectorize():
+    """
+    Real editable-vector pipeline (brief follow-up: "whichever background-
+    removal choice the user makes must be converted into a real, editable
+    vector, not just handed to the digitizer as a raster").
+
+    Runs the exact same classification/background-removal/quantization/
+    raster-to-polygon tracing digitizer/pipeline.py's `image_to_design`
+    does internally, but stops *before* any stitch generation and returns
+    the traced regions themselves as plain JSON vector shapes -- meant for
+    a client to render as editable paths (select/delete/redraw) before the
+    user confirms a final design.
+
+    Multipart form-data request:
+      image            : required, the raw image file.
+      width_mm         : required, target design width in mm.
+      height_mm        : required, target design height in mm.
+      max_colors       : optional int, 1-16, default 6.
+      max_dim          : optional int, default 150 (digitizer.pipeline.
+                          DEFAULT_MAX_DIM) -- may be raised up to
+                          MAX_MAX_DIM for finer traced detail, since this
+                          endpoint does no stitch generation itself and so
+                          doesn't need to stay as cheap as image-to-points.
+      smooth_curves    : optional bool, default true.
+      remove_background: optional bool, default true -- see
+                          /api/design/remove-background. Pass false for
+                          "keep original"; manual `bg_strokes` (below) still
+                          apply on top either way.
+      auto_vectorize   : optional bool, default true -- see image-to-points.
+      bg_strokes       : optional JSON-encoded string: a list of manual
+                          background-mask correction brush strokes, each
+                          {"mode": "restore"|"erase", "radius": 0..1,
+                           "points": [[nx, ny], ...]} with every coordinate/
+                          radius normalized 0..1 over the image -- the
+                          "adjustable-size brush to manually restore or
+                          erase parts of the background-removal mask"
+                          requirement. See
+                          digitizer.segmentation.background_removal.
+                          apply_mask_strokes for the exact semantics.
+
+    Response JSON on success:
+      {"widthMm", "heightMm", "artworkKind", "artworkConfidence",
+       "regions": [{"id", "colorHex", "areaMm2",
+                     "rings": [[[xMm, yMm], ...], ...]}, ...]}
+
+    Pass the (optionally user-edited) `regions` array straight to
+    /api/design/regions-to-points or /api/design/regions-to-file to finish
+    building the design.
+
+    Or {"error": "..."} with a 400 status on a malformed request, an
+    unreadable image, invalid `bg_strokes` JSON, or an image with no
+    detectable foreground.
+    """
+    image_file = request.files.get("image")
+    if image_file is None or image_file.filename == "":
+        return jsonify({"error": "'image' file field is required"}), 400
+
+    form = request.form
+
+    def _float_field(key: str, default: float) -> float:
+        raw = form.get(key)
+        return default if raw in (None, "") else float(raw)
+
+    def _int_field(key: str, default: int) -> int:
+        raw = form.get(key)
+        return default if raw in (None, "") else int(raw)
+
+    def _bool_field(key: str, default: bool) -> bool:
+        raw = form.get(key)
+        return default if raw in (None, "") else str(raw).strip().lower() not in ("0", "false", "no")
+
+    try:
+        width_mm = _float_field("width_mm", 0)
+        height_mm = _float_field("height_mm", 0)
+        if width_mm <= 0 or height_mm <= 0:
+            return jsonify({"error": "'width_mm' and 'height_mm' are required and must be positive"}), 400
+
+        max_colors = _int_field("max_colors", 6)
+        max_dim = _int_field("max_dim", 150)
+        smooth_curves = _bool_field("smooth_curves", True)
+        remove_background_flag = _bool_field("remove_background", True)
+        auto_vectorize = _bool_field("auto_vectorize", True)
+        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+            return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
+
+        raw_strokes = form.get("bg_strokes")
+        bg_strokes = None
+        if raw_strokes not in (None, ""):
+            try:
+                bg_strokes = json.loads(raw_strokes)
+            except (TypeError, ValueError):
+                return jsonify({"error": "'bg_strokes' must be valid JSON"}), 400
+            if not isinstance(bg_strokes, list):
+                return jsonify({"error": "'bg_strokes' must be a JSON array"}), 400
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"invalid numeric field: {e}"}), 400
+
+    try:
+        result = image_to_vector_regions(
+            image_file.read(),
+            width_mm=width_mm,
+            height_mm=height_mm,
+            max_colors=max_colors,
+            max_dim=max_dim,
+            smooth_curves=smooth_curves,
+            remove_background=remove_background_flag,
+            auto_vectorize=auto_vectorize,
+            bg_strokes=bg_strokes,
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return jsonify(
+        {
+            "widthMm": result["width_mm"],
+            "heightMm": result["height_mm"],
+            "artworkKind": result["artwork_kind"],
+            "artworkConfidence": result["artwork_confidence"],
+            "regions": [
+                {
+                    "id": r["id"],
+                    "colorHex": r["color_hex"],
+                    "areaMm2": r["area_mm2"],
+                    "rings": r["rings"],
+                }
+                for r in result["regions"]
+            ],
+        }
+    )
+
+
+def _design_from_regions_request() -> tuple[EmbroideryDesign | None, tuple | None]:
+    """Shared JSON-body parsing + design-building for both regions-to-points
+    and regions-to-file -- mirrors `_digitize_image_from_request` above, but
+    for the no-image, region-list-in/design-out half of the editable-vector
+    pipeline (see /api/design/vectorize)."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None, (jsonify({"error": "request body must be a JSON object"}), 400)
+
+    regions = body.get("regions")
+    if not isinstance(regions, list) or not regions:
+        return None, (jsonify({"error": "'regions' is required and must be a non-empty array"}), 400)
+
+    def _num(key: str, default):
+        raw = body.get(key, default)
+        return default if raw is None else raw
+
+    try:
+        width_mm = float(_num("widthMm", 0))
+        height_mm = float(_num("heightMm", 0))
+        if width_mm <= 0 or height_mm <= 0:
+            return None, (jsonify({"error": "'widthMm' and 'heightMm' are required and must be positive"}), 400)
+
+        stitch_style = str(body.get("stitchStyle") or "fill").strip().lower()
+        if stitch_style not in STITCH_STYLES:
+            return None, (jsonify({"error": f"'stitchStyle' must be one of {list(STITCH_STYLES)}"}), 400)
+
+        stitch_length_mm = float(_num("stitchLengthMm", 3.0))
+        density_mm = body.get("densityMm")
+        density_mm = None if density_mm in (None, "") else float(density_mm)
+        angle_deg = float(_num("angleDeg", 0.0))
+        border_width_mm = body.get("borderWidthMm")
+        border_width_mm = None if border_width_mm in (None, "") else float(border_width_mm)
+        artwork_kind = str(body.get("artworkKind") or "flat")
+        artwork_confidence = float(_num("artworkConfidence", 1.0))
+    except (TypeError, ValueError) as e:
+        return None, (jsonify({"error": f"invalid numeric field: {e}"}), 400)
+
+    normalized_regions = [
+        {"color_hex": r.get("colorHex"), "rings": r.get("rings")} for r in regions if isinstance(r, dict)
+    ]
+
+    try:
+        design = design_from_region_records(
+            normalized_regions,
+            width_mm=width_mm,
+            height_mm=height_mm,
+            stitch_length_mm=stitch_length_mm,
+            density_mm=density_mm,
+            angle_deg=angle_deg,
+            stitch_style=stitch_style,
+            border_width_mm=border_width_mm,
+            artwork_kind=artwork_kind,
+            artwork_confidence=artwork_confidence,
+        )
+    except ValueError as e:
+        return None, (jsonify({"error": str(e)}), 400)
+
+    return design, None
+
+
+@app.post("/api/design/regions-to-points")
+def regions_to_points():
+    """
+    Builds a real digitized design from a (possibly user-edited) region
+    list -- normally /api/design/vectorize's own output, after a client has
+    let the user select/delete/redraw regions on top of it -- and returns
+    the same JSON point-stream contract as /api/design/image-to-points, for
+    client-side preview rendering (e.g. stitch-pro's Simulator screen).
+
+    JSON body:
+      {"widthMm", "heightMm",
+       "regions": [{"colorHex", "rings"}, ...],   // vectorize's own shape
+       "stitchStyle": "fill"|"cross",              // optional, default fill
+       "stitchLengthMm", "densityMm", "angleDeg", "borderWidthMm",  // all optional
+       "artworkKind", "artworkConfidence"}         // optional passthrough, purely informational
+
+    Response/error shape identical to /api/design/image-to-points.
+    """
+    design, err = _design_from_regions_request()
+    if err is not None:
+        return err
+
+    try:
+        result = design_to_points(design)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    result["artworkKind"] = design.metadata.get("artwork_kind")
+    result["artworkConfidence"] = design.metadata.get("artwork_confidence")
+    return jsonify(result)
+
+
+@app.post("/api/design/regions-to-file")
+def regions_to_file():
+    """
+    Same region-list-in design-building as /api/design/regions-to-points,
+    but returns a real machine file -- the editable-vector pipeline's
+    equivalent of /api/design/image-to-file, for final export once the
+    user has confirmed their edited region list.
+
+    JSON body: same fields as /api/design/regions-to-points, plus:
+      "format" : optional, one of SUPPORTED_FORMATS, default "dst".
+      "name"   : optional, used for the download filename.
+
+    Returns the file as a binary attachment download on success, or
+    {"error": "..."} with a 400 status on a malformed request or a region
+    list that produces no stitch objects.
+    """
+    body = request.get_json(silent=True) or {}
+    fmt = str(body.get("format", "dst")).lower()
+    if fmt not in SUPPORTED_FORMATS:
+        return jsonify({"error": f"unsupported format {fmt!r}", "supported": list(SUPPORTED_FORMATS)}), 400
+
+    design, err = _design_from_regions_request()
+    if err is not None:
+        return err
+
+    name = str(body.get("name") or "design")
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("-", "_")) or "design"
+
+    try:
+        file_bytes = design_to_format_bytes(design, fmt)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    return send_file(
+        io.BytesIO(file_bytes),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=f"{safe_name}.{fmt}",
+    )
 
 
 if __name__ == "__main__":

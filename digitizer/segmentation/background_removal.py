@@ -194,6 +194,106 @@ def _representative_colors(colors: list[Rgb], max_colors: int) -> list[Rgb]:
     return [(palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]) for i in range(n)]
 
 
+def reference_colors_from_mask(rgba: Image.Image, mask: list[list[bool]], max_colors: int = 16) -> list[Rgb]:
+    """Builds the same kind of "trusted reference palette"
+    `compute_background_mask_and_reference` returns, but from an already-
+    decided mask instead of computing one -- used when a caller supplies
+    its own corrected mask (e.g. after a user's manual restore/erase brush
+    strokes, see `apply_mask_strokes` below) and color_quantize.py's
+    anti-aliasing-aware merge step still needs *some* reference colors to
+    recognize a blended edge pixel as "toward the background", not a new
+    design color.
+    """
+    img = rgba.convert("RGBA")
+    w, h = img.size
+    px = img.load()
+    colors: list[Rgb] = []
+    for y in range(h):
+        row = mask[y]
+        for x in range(w):
+            if row[x]:
+                r, g, b, _a = px[x, y]
+                colors.append((r, g, b))
+    return _representative_colors(colors, max_colors=max_colors)
+
+
+def apply_mask_strokes(
+    mask: list[list[bool]],
+    w: int,
+    h: int,
+    strokes: list[dict],
+) -> list[list[bool]]:
+    """Applies a user's manual background-mask correction brush strokes on
+    top of an already-computed background mask (brief follow-up: "an
+    adjustable-size brush to manually restore or erase parts of the
+    background-removal mask for accuracy").
+
+    Each stroke is a dict:
+      {"mode": "restore" | "erase",
+       "radius": <0..1, brush radius as a fraction of max(w, h)>,
+       "points": [[nx, ny], ...]}   # each nx/ny normalized 0..1 over the image
+
+    `"restore"` forces every pixel within `radius` of the stroke's path back
+    to foreground (`mask = False`) -- for a piece of the real design a
+    photo's automatic flood fill wrongly swept up as background. `"erase"`
+    forces pixels to background (`mask = True`) -- for background/shirt
+    material the automatic detection missed.
+
+    Coordinates and radius are normalized (0..1) rather than raw pixels so
+    a client can record strokes once against whatever resolution a preview
+    image happened to be shown at, and this function (called again later,
+    against whatever resolution the real digitizing pipeline works at
+    internally) reproduces the identical correction regardless of any
+    difference between those two resolutions.
+
+    Returns a new mask (does not mutate the input), same `[h][w]` shape.
+    Strokes are applied in list order, so a later stroke covering the same
+    area wins over an earlier one -- matches the intuitive "last brush
+    stroke on top" behavior of any paint tool.
+    """
+    if not strokes:
+        return mask
+    out = [row[:] for row in mask]
+    diag_unit = max(1, max(w, h))
+    for stroke in strokes:
+        mode = stroke.get("mode")
+        if mode not in ("restore", "erase"):
+            continue
+        points = stroke.get("points") or []
+        if not points:
+            continue
+        radius_px = max(0.5, float(stroke.get("radius", 0.02)) * diag_unit)
+        set_to = mode == "erase"  # erase -> background (True), restore -> foreground (False)
+        pixel_points = [(nx * w, ny * h) for nx, ny in points]
+        segments = (
+            list(zip(pixel_points, pixel_points[1:])) if len(pixel_points) > 1 else [(pixel_points[0], pixel_points[0])]
+        )
+        for (ax, ay), (bx, by) in segments:
+            min_x = max(0, int((min(ax, bx) - radius_px)))
+            max_x = min(w - 1, int((max(ax, bx) + radius_px)))
+            min_y = max(0, int((min(ay, by) - radius_px)))
+            max_y = min(h - 1, int((max(ay, by) + radius_px)))
+            if min_x > max_x or min_y > max_y:
+                continue
+            dx, dy = bx - ax, by - ay
+            seg_len2 = dx * dx + dy * dy
+            r2 = radius_px * radius_px
+            for y in range(min_y, max_y + 1):
+                py = y + 0.5
+                row = out[y]
+                for x in range(min_x, max_x + 1):
+                    px_ = x + 0.5
+                    if seg_len2 <= 1e-9:
+                        d2 = (px_ - ax) ** 2 + (py - ay) ** 2
+                    else:
+                        t = max(0.0, min(1.0, ((px_ - ax) * dx + (py - ay) * dy) / seg_len2))
+                        cx, cy = ax + t * dx, ay + t * dy
+                        d2 = (px_ - cx) ** 2 + (py - cy) ** 2
+                    if d2 <= r2:
+                        row[x] = set_to
+    return out
+
+
 def compute_background_mask(
     rgba: Image.Image,
     alpha_threshold: int = 16,

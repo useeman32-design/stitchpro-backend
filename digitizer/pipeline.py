@@ -57,7 +57,7 @@ from shapely.geometry import Polygon
 from digitizer.classifier.classify_artwork import classify_artwork
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
 from digitizer.segmentation.artworkify import artworkify
-from digitizer.segmentation.background_removal import compute_background_mask
+from digitizer.segmentation.background_removal import apply_mask_strokes, compute_background_mask
 from digitizer.segmentation.color_quantize import build_label_grid, despeckle_label_grid
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
 from digitizer.stitches.puff.eligibility import is_puff_eligible
@@ -187,138 +187,31 @@ _APPLIQUE_MIN_DOMINANT_AREA_FRACTION = 0.40
 _APPLIQUE_MIN_CONVEXITY = 0.85
 
 
-def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
-    img = Image.open(io.BytesIO(image_bytes))
-    img.load()
-    w, h = img.size
-    if w <= 0 or h <= 0:
-        raise ValueError("image has zero width or height")
-    scale = min(1.0, max_dim / max(w, h))
-    if scale < 1.0:
-        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
-        img = img.resize(new_size, Image.LANCZOS)
-    return img
+def _build_region_records(
+    label_grid: list[list[int]],
+    palette_hex: list[str],
+    px_to_mm_x: float,
+    px_to_mm_y: float,
+    smooth_curves: bool,
+) -> tuple[list[dict], float, list[str]]:
+    """Traces every detected region (across all colors) in `label_grid` into
+    mm-space polygon rings, plus each one's outer-boundary area -- the
+    actual raster-to-vector step, shared by `image_to_design` (which
+    immediately turns these into stitch objects) and `image_to_vector_regions`
+    (which returns them as-is, for a client to review/edit *before* any
+    stitch generation happens -- see that function's docstring).
 
-
-def image_to_design(
-    image_bytes: bytes,
-    width_mm: float,
-    height_mm: float,
-    max_colors: int = 6,
-    stitch_length_mm: float = 3.0,
-    density_mm: float | None = None,
-    max_dim: int = DEFAULT_MAX_DIM,
-    angle_deg: float = 0.0,
-    stitch_style: str = "fill",
-    smooth_curves: bool = True,
-    border_width_mm: float | None = None,
-    remove_background: bool = True,
-    auto_vectorize: bool = True,
-) -> EmbroideryDesign:
-    """Digitize a raw image into an EmbroideryDesign of stitch objects, one
-    (or more, if a color appears in several disconnected regions) per
-    detected color, sized to fit `width_mm` x `height_mm`.
-
-    `auto_vectorize` (default `True`) runs `classify_artwork` on the
-    (downscaled) image first and, only when it's classified `'photo'`, runs
-    it through `artworkify` before anything else below ever sees it -- see
-    the module docstring for why this is the actual fix for "a real photo
-    digitizes badly", not a resolution or quantization-tuning problem. The
-    detected `artwork_kind` (`'flat'` or `'photo'`, or `'flat (forced)'`
-    when `auto_vectorize=False` skipped classification entirely) and its
-    confidence are recorded on the returned design's `metadata` dict for
-    callers that want to show the user what was detected. Pass `False`
-    only to reproduce the exact pre-existing behavior (e.g. a regression
-    test pinned to the old flat-art-only pipeline, or a caller that already
-    knows its input is a clean vector export and wants to skip the
-    classification work entirely).
-
-    `density_mm` left as `None` (the default) picks a sensible default for
-    whichever `stitch_style` was chosen (see `_DEFAULT_DENSITY_MM_BY_STYLE`)
-    rather than forcing one fixed number to do double duty as both a
-    sensible fill-row spacing and a sensible cross-stitch cell size.
-
-    `border_width_mm` likewise defaults (when left `None`) per
-    `_DEFAULT_BORDER_MM_BY_STYLE` -- a satin edge-walk border around every
-    region's outline and holes for FILL, none for CROSS_STITCH. Pass `0`
-    explicitly to disable it for FILL too.
-
-    `remove_background` (default `True`) runs the same border-connected
-    flood-fill background/surrounding-material removal
-    (digitizer.segmentation.background_removal) the standalone
-    `remove_background_preview` function below shows the user ahead of
-    time. Pass `False` only when the user explicitly chose "keep original"
-    on that preview step -- every pixel is then treated as foreground
-    (subject only to its own alpha channel), so the final digitized design
-    matches exactly what they were shown and agreed to.
-
-    Raises ValueError for an unreadable image, degenerate dimensions, an
-    unrecognized `stitch_style`, or an image with no detectable foreground
-    (e.g. a solid blank image, or one that is entirely surrounding
-    material/background once that's removed).
+    Returns `(region_records, total_foreground_area_mm2, threads)`:
+      - `region_records[i]` is `{"color_index", "i", "color_hex", "rings",
+        "area_mm2"}` -- `"rings"` is `[outer_ring, *hole_rings]`, each a list
+        of `(x_mm, y_mm)` points.
+      - `total_foreground_area_mm2` is the sum of every region's own area,
+        used by the PUFF_3D/APPLIQUE heuristics to judge a region's size
+        relative to the whole design, not in isolation.
+      - `threads` is the subset of `palette_hex` that actually produced at
+        least one traced region (a palette color can end up with zero
+        pixels after quantization/despeckling).
     """
-    if width_mm <= 0 or height_mm <= 0:
-        raise ValueError("width_mm and height_mm must both be positive")
-    if not (1 <= max_colors <= 16):
-        raise ValueError("max_colors must be between 1 and 16")
-    if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
-        raise ValueError(f"max_dim must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}")
-    if stitch_style not in STITCH_STYLES:
-        raise ValueError(f"stitch_style must be one of {STITCH_STYLES}, got {stitch_style!r}")
-
-    effective_density_mm = density_mm if density_mm is not None else _DEFAULT_DENSITY_MM_BY_STYLE[stitch_style]
-    if effective_density_mm <= 0:
-        raise ValueError("density_mm must be > 0")
-
-    effective_border_mm = border_width_mm if border_width_mm is not None else _DEFAULT_BORDER_MM_BY_STYLE[stitch_style]
-    if effective_border_mm < 0:
-        raise ValueError("border_width_mm must be >= 0")
-
-    try:
-        img = load_and_downscale(image_bytes, max_dim)
-    except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
-        raise ValueError(f"could not read image: {e}") from e
-
-    w, h = img.size
-    px_to_mm_x = width_mm / w
-    px_to_mm_y = height_mm / h
-
-    label_grid_kwargs: dict[str, float] = {}
-    if auto_vectorize:
-        artwork_info = classify_artwork(img)
-        artwork_kind = artwork_info["kind"]
-        artwork_confidence = artwork_info["confidence"]
-        if artwork_kind == "photo":
-            img = artworkify(img)
-            label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
-    else:
-        artwork_kind = "flat (forced)"
-        artwork_confidence = 1.0
-
-    palette_hex, label_grid = build_label_grid(
-        img,
-        max_colors,
-        remove_background=remove_background,
-        **label_grid_kwargs,
-    )
-    if artwork_kind == "photo":
-        # Collapses the dozens of tiny texture-noise islands a close-up
-        # photo's per-thread shading leaves behind (even after artworkify's
-        # denoise+posterize) into their surrounding real region, instead of
-        # each becoming its own near-useless stitch object -- see
-        # despeckle_label_grid's own docstring for why this is a different
-        # (and necessary, in addition to) fix from label_grid_to_ring_groups'
-        # own min_area_px/min_bbox_mm filters below.
-        label_grid = despeckle_label_grid(label_grid)
-
-    object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
-
-    # First pass: gather every detected region (across all colors) plus its
-    # outer-boundary area, so the PUFF_3D/APPLIQUE heuristics below can
-    # weigh a region against the rest of the design (e.g. "is this really
-    # the dominant shape?"), not judge it in total isolation. Doesn't
-    # change anything about which regions get detected -- same
-    # label_grid_to_ring_groups call as before, just gathered up front.
     region_records: list[dict] = []
     total_foreground_area_mm2 = 0.0
     threads: list[str] = []
@@ -346,6 +239,28 @@ def image_to_design(
             region_records.append(
                 {"color_index": color_index, "i": i, "color_hex": color_hex, "rings": rings, "area_mm2": area_mm2}
             )
+    return region_records, total_foreground_area_mm2, threads
+
+
+def _region_records_to_objects(
+    region_records: list[dict],
+    total_foreground_area_mm2: float,
+    stitch_style: str,
+    stitch_length_mm: float,
+    effective_density_mm: float,
+    angle_deg: float,
+    effective_border_mm: float,
+) -> list[EmbroideryObject]:
+    """Turns traced vector regions (see `_build_region_records`, or a
+    client's own edited region list via `image_to_vector_regions` ->
+    `design_from_region_records`) into styled embroidery objects: per-shape
+    SATIN/BEAN/MOTIF/PUFF_3D/APPLIQUE auto-classification exactly as
+    `image_to_design` always did, now shared by both that function and
+    `design_from_region_records` so a design built from a (possibly user-
+    edited) region list gets identical stitch-type treatment to one built
+    straight from an image.
+    """
+    object_type = ObjectType.FILL if stitch_style == "fill" else ObjectType.CROSS_STITCH
 
     objects: list[EmbroideryObject] = []
     applique_candidates: list[tuple[int, float]] = []  # (index into objects, area_mm2)
@@ -480,6 +395,365 @@ def image_to_design(
             "no foreground regions detected -- image may be blank, fully transparent, "
             "or a single solid color matching the detected background"
         )
+
+    return objects
+
+
+def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
+    img = Image.open(io.BytesIO(image_bytes))
+    img.load()
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        raise ValueError("image has zero width or height")
+    scale = min(1.0, max_dim / max(w, h))
+    if scale < 1.0:
+        new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        img = img.resize(new_size, Image.LANCZOS)
+    return img
+
+
+def image_to_design(
+    image_bytes: bytes,
+    width_mm: float,
+    height_mm: float,
+    max_colors: int = 6,
+    stitch_length_mm: float = 3.0,
+    density_mm: float | None = None,
+    max_dim: int = DEFAULT_MAX_DIM,
+    angle_deg: float = 0.0,
+    stitch_style: str = "fill",
+    smooth_curves: bool = True,
+    border_width_mm: float | None = None,
+    remove_background: bool = True,
+    auto_vectorize: bool = True,
+) -> EmbroideryDesign:
+    """Digitize a raw image into an EmbroideryDesign of stitch objects, one
+    (or more, if a color appears in several disconnected regions) per
+    detected color, sized to fit `width_mm` x `height_mm`.
+
+    `auto_vectorize` (default `True`) runs `classify_artwork` on the
+    (downscaled) image first and, only when it's classified `'photo'`, runs
+    it through `artworkify` before anything else below ever sees it -- see
+    the module docstring for why this is the actual fix for "a real photo
+    digitizes badly", not a resolution or quantization-tuning problem. The
+    detected `artwork_kind` (`'flat'` or `'photo'`, or `'flat (forced)'`
+    when `auto_vectorize=False` skipped classification entirely) and its
+    confidence are recorded on the returned design's `metadata` dict for
+    callers that want to show the user what was detected. Pass `False`
+    only to reproduce the exact pre-existing behavior (e.g. a regression
+    test pinned to the old flat-art-only pipeline, or a caller that already
+    knows its input is a clean vector export and wants to skip the
+    classification work entirely).
+
+    `density_mm` left as `None` (the default) picks a sensible default for
+    whichever `stitch_style` was chosen (see `_DEFAULT_DENSITY_MM_BY_STYLE`)
+    rather than forcing one fixed number to do double duty as both a
+    sensible fill-row spacing and a sensible cross-stitch cell size.
+
+    `border_width_mm` likewise defaults (when left `None`) per
+    `_DEFAULT_BORDER_MM_BY_STYLE` -- a satin edge-walk border around every
+    region's outline and holes for FILL, none for CROSS_STITCH. Pass `0`
+    explicitly to disable it for FILL too.
+
+    `remove_background` (default `True`) runs the same border-connected
+    flood-fill background/surrounding-material removal
+    (digitizer.segmentation.background_removal) the standalone
+    `remove_background_preview` function below shows the user ahead of
+    time. Pass `False` only when the user explicitly chose "keep original"
+    on that preview step -- every pixel is then treated as foreground
+    (subject only to its own alpha channel), so the final digitized design
+    matches exactly what they were shown and agreed to.
+
+    Raises ValueError for an unreadable image, degenerate dimensions, an
+    unrecognized `stitch_style`, or an image with no detectable foreground
+    (e.g. a solid blank image, or one that is entirely surrounding
+    material/background once that's removed).
+    """
+    if width_mm <= 0 or height_mm <= 0:
+        raise ValueError("width_mm and height_mm must both be positive")
+    if not (1 <= max_colors <= 16):
+        raise ValueError("max_colors must be between 1 and 16")
+    if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+        raise ValueError(f"max_dim must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}")
+    if stitch_style not in STITCH_STYLES:
+        raise ValueError(f"stitch_style must be one of {STITCH_STYLES}, got {stitch_style!r}")
+
+    effective_density_mm = density_mm if density_mm is not None else _DEFAULT_DENSITY_MM_BY_STYLE[stitch_style]
+    if effective_density_mm <= 0:
+        raise ValueError("density_mm must be > 0")
+
+    effective_border_mm = border_width_mm if border_width_mm is not None else _DEFAULT_BORDER_MM_BY_STYLE[stitch_style]
+    if effective_border_mm < 0:
+        raise ValueError("border_width_mm must be >= 0")
+
+    try:
+        img = load_and_downscale(image_bytes, max_dim)
+    except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
+        raise ValueError(f"could not read image: {e}") from e
+
+    w, h = img.size
+    px_to_mm_x = width_mm / w
+    px_to_mm_y = height_mm / h
+
+    label_grid_kwargs: dict[str, float] = {}
+    if auto_vectorize:
+        artwork_info = classify_artwork(img)
+        artwork_kind = artwork_info["kind"]
+        artwork_confidence = artwork_info["confidence"]
+        if artwork_kind == "photo":
+            img = artworkify(img)
+            label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
+    else:
+        artwork_kind = "flat (forced)"
+        artwork_confidence = 1.0
+
+    palette_hex, label_grid = build_label_grid(
+        img,
+        max_colors,
+        remove_background=remove_background,
+        **label_grid_kwargs,
+    )
+    if artwork_kind == "photo":
+        # Collapses the dozens of tiny texture-noise islands a close-up
+        # photo's per-thread shading leaves behind (even after artworkify's
+        # denoise+posterize) into their surrounding real region, instead of
+        # each becoming its own near-useless stitch object -- see
+        # despeckle_label_grid's own docstring for why this is a different
+        # (and necessary, in addition to) fix from label_grid_to_ring_groups'
+        # own min_area_px/min_bbox_mm filters below.
+        label_grid = despeckle_label_grid(label_grid)
+
+    region_records, total_foreground_area_mm2, threads = _build_region_records(
+        label_grid, palette_hex, px_to_mm_x, px_to_mm_y, smooth_curves
+    )
+
+    objects = _region_records_to_objects(
+        region_records,
+        total_foreground_area_mm2,
+        stitch_style,
+        stitch_length_mm,
+        effective_density_mm,
+        angle_deg,
+        effective_border_mm,
+    )
+
+    return EmbroideryDesign(
+        width_mm=width_mm,
+        height_mm=height_mm,
+        objects=objects,
+        threads=threads,
+        metadata={"artwork_kind": artwork_kind, "artwork_confidence": artwork_confidence},
+    )
+
+
+def image_to_vector_regions(
+    image_bytes: bytes,
+    width_mm: float,
+    height_mm: float,
+    max_colors: int = 6,
+    max_dim: int = DEFAULT_MAX_DIM,
+    smooth_curves: bool = True,
+    remove_background: bool = True,
+    auto_vectorize: bool = True,
+    bg_strokes: list[dict] | None = None,
+) -> dict:
+    """Runs everything `image_to_design` does *up to* (and not including)
+    stitch generation -- classify/artworkify, background removal, color
+    quantization, raster-to-polygon tracing -- and returns the traced
+    regions themselves as plain, JSON-ready vector data instead of
+    immediately turning them into stitch objects.
+
+    This exists for the "the chosen background-removal image must become a
+    real, editable vector, not just get handed to the digitizer as a
+    raster" requirement: a client calls this once, shows the user the
+    traced regions as editable shapes (select/delete/redraw), and only then
+    calls `design_from_region_records` with whatever region list the user
+    ended up confirming -- which may differ from what this function
+    returned (a region removed, merged, or hand-edited).
+
+    `bg_strokes`, when given, is a list of manual mask-correction brush
+    strokes (see `background_removal.apply_mask_strokes` for the exact
+    shape) applied on top of the automatically detected background mask
+    before quantization -- the "adjustable-size brush to manually restore
+    or erase parts of the background-removal mask" requirement. Strokes use
+    normalized (0..1) coordinates/radius, so a client can record them
+    against a preview image shown at any resolution and this function
+    reproduces the same correction at whatever resolution it works at
+    internally. Strokes still apply even when `remove_background=False`
+    (every pixel starts foreground, but an "erase" stroke can still mark
+    part of it background) -- the user may have chosen "keep original" and
+    still want to manually knock out a stray bit of background by hand.
+
+    Returns:
+      {"width_mm", "height_mm", "artwork_kind", "artwork_confidence",
+       "regions": [{"id", "color_hex", "area_mm2",
+                     "rings": [[[x_mm, y_mm], ...], ...]}, ...]}
+
+    `"id"` matches the `region-{color_index}-{i}` scheme `image_to_design`
+    gives its own objects, so a client's region edits (e.g. "the user
+    deleted region-2-0") can be matched straight through to
+    `design_from_region_records` without any extra bookkeeping. `"rings"`
+    is `[outer_ring, *hole_rings]`, exactly like an `EmbroideryObject`'s own
+    `geometry` for a FILL/CROSS_STITCH/PUFF_3D region.
+
+    Raises ValueError under the same conditions as `image_to_design`
+    (unreadable image, degenerate dimensions, no detectable foreground).
+    """
+    if width_mm <= 0 or height_mm <= 0:
+        raise ValueError("width_mm and height_mm must both be positive")
+    if not (1 <= max_colors <= 16):
+        raise ValueError("max_colors must be between 1 and 16")
+    if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+        raise ValueError(f"max_dim must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}")
+
+    try:
+        img = load_and_downscale(image_bytes, max_dim)
+    except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
+        raise ValueError(f"could not read image: {e}") from e
+
+    w, h = img.size
+    px_to_mm_x = width_mm / w
+    px_to_mm_y = height_mm / h
+
+    if auto_vectorize:
+        artwork_info = classify_artwork(img)
+        artwork_kind = artwork_info["kind"]
+        artwork_confidence = artwork_info["confidence"]
+        if artwork_kind == "photo":
+            img = artworkify(img)
+    else:
+        artwork_kind = "flat (forced)"
+        artwork_confidence = 1.0
+
+    rgba = img.convert("RGBA")
+    if remove_background:
+        bg_mask = compute_background_mask(rgba)
+    else:
+        bg_mask = [[False] * w for _ in range(h)]
+    if bg_strokes:
+        bg_mask = apply_mask_strokes(bg_mask, w, h, bg_strokes)
+
+    palette_hex, label_grid = build_label_grid(img, max_colors, bg_mask_override=bg_mask)
+    if artwork_kind == "photo":
+        label_grid = despeckle_label_grid(label_grid)
+
+    region_records, _total_area_mm2, _threads = _build_region_records(
+        label_grid, palette_hex, px_to_mm_x, px_to_mm_y, smooth_curves
+    )
+
+    if not region_records:
+        raise ValueError(
+            "no foreground regions detected -- image may be blank, fully transparent, "
+            "or a single solid color matching the detected background"
+        )
+
+    return {
+        "width_mm": width_mm,
+        "height_mm": height_mm,
+        "artwork_kind": artwork_kind,
+        "artwork_confidence": artwork_confidence,
+        "regions": [
+            {
+                "id": f"region-{rec['color_index']}-{rec['i']}",
+                "color_hex": rec["color_hex"],
+                "area_mm2": rec["area_mm2"],
+                "rings": [[[round(x, 4), round(y, 4)] for x, y in ring] for ring in rec["rings"]],
+            }
+            for rec in region_records
+        ],
+    }
+
+
+def design_from_region_records(
+    regions: list[dict],
+    width_mm: float,
+    height_mm: float,
+    stitch_length_mm: float = 3.0,
+    density_mm: float | None = None,
+    angle_deg: float = 0.0,
+    stitch_style: str = "fill",
+    border_width_mm: float | None = None,
+    artwork_kind: str = "flat",
+    artwork_confidence: float = 1.0,
+) -> EmbroideryDesign:
+    """The other half of the editable-vector pipeline (see
+    `image_to_vector_regions`): turns a region list -- normally that
+    function's own output, after a client has let the user select/delete/
+    redraw regions on top of it -- into a real `EmbroideryDesign`, with
+    identical per-region SATIN/BEAN/MOTIF/PUFF_3D/APPLIQUE auto-
+    classification to `image_to_design`, so a design built this way looks
+    exactly like one built straight from the image (for whatever regions
+    the user chose to keep).
+
+    `regions` is `[{"color_hex", "rings"}, ...]` -- `"id"`/`"area_mm2"`, if
+    present (e.g. passed straight back from `image_to_vector_regions`), are
+    ignored/recomputed here, so a client doesn't need to strip them before
+    resubmitting. `"rings"` is `[outer_ring, *hole_rings]`, each ring a list
+    of `[x_mm, y_mm]` (or `(x_mm, y_mm)`) pairs -- exactly the shape
+    `image_to_vector_regions` returns, so its output (minus whatever the
+    user removed/edited) can be passed straight back in.
+
+    Raises ValueError for degenerate dimensions, an unrecognized
+    `stitch_style`, an empty/invalid region list, or a region list that
+    (after classification) produces no stitch objects at all.
+    """
+    if width_mm <= 0 or height_mm <= 0:
+        raise ValueError("width_mm and height_mm must both be positive")
+    if stitch_style not in STITCH_STYLES:
+        raise ValueError(f"stitch_style must be one of {STITCH_STYLES}, got {stitch_style!r}")
+    if not regions:
+        raise ValueError("'regions' must be a non-empty list")
+
+    effective_density_mm = density_mm if density_mm is not None else _DEFAULT_DENSITY_MM_BY_STYLE[stitch_style]
+    if effective_density_mm <= 0:
+        raise ValueError("density_mm must be > 0")
+    effective_border_mm = border_width_mm if border_width_mm is not None else _DEFAULT_BORDER_MM_BY_STYLE[stitch_style]
+    if effective_border_mm < 0:
+        raise ValueError("border_width_mm must be >= 0")
+
+    region_records: list[dict] = []
+    total_foreground_area_mm2 = 0.0
+    threads: list[str] = []
+    seen_colors: dict[str, int] = {}
+    counts_by_color: dict[int, int] = {}
+    for region in regions:
+        color_hex = str(region.get("color_hex") or "#000000")
+        raw_rings = region.get("rings")
+        if not raw_rings or not raw_rings[0] or len(raw_rings[0]) < 3:
+            continue  # degenerate ring (no outer boundary, or too few points to be a polygon)
+        rings = [[(float(x), float(y)) for x, y in ring] for ring in raw_rings]
+
+        color_index = seen_colors.setdefault(color_hex, len(seen_colors))
+        if color_index == len(threads):
+            threads.append(color_hex)
+        i = counts_by_color.get(color_index, 0)
+        counts_by_color[color_index] = i + 1
+
+        area_mm2 = 0.0
+        try:
+            poly = Polygon(rings[0])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            area_mm2 = poly.area
+        except Exception:  # noqa: BLE001 - degenerate ring geometry, treat as zero area
+            area_mm2 = 0.0
+        total_foreground_area_mm2 += area_mm2
+        region_records.append(
+            {"color_index": color_index, "i": i, "color_hex": color_hex, "rings": rings, "area_mm2": area_mm2}
+        )
+
+    if not region_records:
+        raise ValueError("'regions' contained no usable (non-degenerate) shapes")
+
+    objects = _region_records_to_objects(
+        region_records,
+        total_foreground_area_mm2,
+        stitch_style,
+        stitch_length_mm,
+        effective_density_mm,
+        angle_deg,
+        effective_border_mm,
+    )
 
     return EmbroideryDesign(
         width_mm=width_mm,

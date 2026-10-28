@@ -28,7 +28,10 @@ from collections import Counter, deque
 
 from PIL import Image
 
-from digitizer.segmentation.background_removal import compute_background_mask_and_reference
+from digitizer.segmentation.background_removal import (
+    compute_background_mask_and_reference,
+    reference_colors_from_mask,
+)
 
 BACKGROUND_LABEL = -1
 
@@ -290,6 +293,7 @@ def build_label_grid(
     color_merge_tolerance: float = 18.0,
     remove_background: bool = True,
     background_blend_tolerance: float = 12.0,
+    bg_mask_override: list[list[bool]] | None = None,
 ) -> tuple[list[str], list[list[int]]]:
     """Reduce `img` (any PIL mode, already downscaled by the caller) to at
     most `max_colors` hex colors plus a label grid.
@@ -359,12 +363,25 @@ def build_label_grid(
     `0.0` for ordinary flat-art callers that skip `artworkify`; that would
     reopen the original anti-aliasing fragmentation bug this rule exists to
     fix.
+
+    `bg_mask_override`, when given, is used directly as the background mask
+    instead of computing one here -- for a caller that already has a mask
+    (optionally user-corrected via a manual restore/erase brush, see
+    `background_removal.apply_mask_strokes`) and wants quantization to
+    respect it exactly rather than recomputing its own. `remove_background`
+    is ignored when this is set. The anti-aliasing blend-line reference
+    colors (see above) are still derived -- from the override mask's own
+    background pixels, via `reference_colors_from_mask` -- so passing a
+    manually-corrected mask doesn't lose that quality improvement.
     """
     rgba = img.convert("RGBA")
     w, h = rgba.size
     rgba_pixels = rgba.load()
 
-    if remove_background:
+    if bg_mask_override is not None:
+        bg_mask = bg_mask_override
+        bg_reference = reference_colors_from_mask(rgba, bg_mask, max_colors=16)
+    elif remove_background:
         bg_mask, bg_reference = compute_background_mask_and_reference(
             rgba, alpha_threshold=alpha_threshold, step_tolerance=bg_step_tolerance
         )
