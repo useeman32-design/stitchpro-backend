@@ -252,6 +252,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         smooth_curves = _bool_field("smooth_curves", True)
         remove_background = _bool_field("remove_background", True)
         auto_vectorize = _bool_field("auto_vectorize", True)
+        force_photo = _bool_field("force_photo", False)
         stitch_style = str(form.get("stitch_style") or "fill").strip().lower()
         if stitch_style not in STITCH_STYLES:
             return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
@@ -275,6 +276,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             border_width_mm=border_width_mm,
             remove_background=remove_background,
             auto_vectorize=auto_vectorize,
+            force_photo=force_photo,
         )
     except ValueError as e:
         return None, (jsonify({"error": str(e)}), 400)
@@ -335,6 +337,15 @@ def image_to_file():
                          /api/design/image-to-points (not surfaced on this
                          binary-file endpoint). Pass false only to force the
                          old flat-art-only behavior.
+      force_photo     : optional bool, default false -- skips the above
+                         classification vote and always treats the image as
+                         a photograph needing artworkify flattening. Set
+                         this for the "extract a design from a photo of an
+                         already-embroidered item" upload entry point,
+                         where the user has already told us it's a photo
+                         (see digitizer/pipeline.py's own docstring for
+                         why an explicit signal beats a guess). Ignored
+                         when auto_vectorize=false.
       max_dim         : optional int, caps the longest image side (in
                          pixels) actually processed, default 150 -- keeps
                          server-side processing cheap regardless of the
@@ -660,6 +671,7 @@ def vectorize():
                           "keep original"; manual `bg_strokes` (below) still
                           apply on top either way.
       auto_vectorize   : optional bool, default true -- see image-to-points.
+      force_photo      : optional bool, default false -- see image-to-points.
       bg_strokes       : optional JSON-encoded string: a list of manual
                           background-mask correction brush strokes, each
                           {"mode": "restore"|"erase", "radius": 0..1,
@@ -713,6 +725,7 @@ def vectorize():
         smooth_curves = _bool_field("smooth_curves", True)
         remove_background_flag = _bool_field("remove_background", True)
         auto_vectorize = _bool_field("auto_vectorize", True)
+        force_photo = _bool_field("force_photo", False)
         if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
             return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
 
@@ -739,6 +752,7 @@ def vectorize():
             remove_background=remove_background_flag,
             auto_vectorize=auto_vectorize,
             bg_strokes=bg_strokes,
+            force_photo=force_photo,
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

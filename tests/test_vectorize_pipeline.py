@@ -151,6 +151,36 @@ class TestImageToVectorRegions:
         )
         assert vec_colors == design_colors, "vectorize and the real digitize pipeline must agree on a photo's colors"
 
+    def test_force_photo_overrides_classification_to_photo(self):
+        # _two_color_png is crisp flat-color artwork -- classify_artwork
+        # must call it 'flat' on its own (sanity check the fixture is a
+        # valid test of the override, not already photo-classified).
+        from digitizer.classifier.classify_artwork import classify_artwork
+
+        img = Image.open(io.BytesIO(_two_color_png()))
+        assert classify_artwork(img)["kind"] == "flat"
+
+        result = image_to_vector_regions(
+            _two_color_png(), width_mm=50, height_mm=50, max_colors=4, force_photo=True
+        )
+        assert result["artwork_kind"] == "photo (forced)"
+        assert result["artwork_confidence"] == 1.0
+        # Still extracts real regions -- forcing the photo path (artworkify
+        # posterize/denoise) on already-flat input should be a near no-op,
+        # not break extraction entirely.
+        assert len(result["regions"]) >= 2
+
+    def test_force_photo_ignored_when_auto_vectorize_false(self):
+        result = image_to_vector_regions(
+            _two_color_png(),
+            width_mm=50,
+            height_mm=50,
+            max_colors=4,
+            force_photo=True,
+            auto_vectorize=False,
+        )
+        assert result["artwork_kind"] == "flat (forced)"
+
     def test_erase_brush_stroke_shrinks_a_region(self):
         baseline = image_to_vector_regions(_solid_box_png(), width_mm=50, height_mm=50, max_colors=4)
         baseline_area = baseline["regions"][0]["area_mm2"]
@@ -280,6 +310,23 @@ class TestVectorizeEndpoint:
             "/api/design/vectorize", data={"width_mm": "50", "height_mm": "50"}, content_type="multipart/form-data"
         )
         assert resp.status_code == 400
+
+    def test_force_photo_field_overrides_classification(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/vectorize",
+            data={
+                "image": (io.BytesIO(_two_color_png()), "logo.png"),
+                "width_mm": "50",
+                "height_mm": "50",
+                "max_colors": "4",
+                "force_photo": "true",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["artworkKind"] == "photo (forced)"
 
     def test_bg_strokes_accepted_and_change_output(self):
         client = _client()

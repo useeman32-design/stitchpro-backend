@@ -164,6 +164,23 @@ class TestAutoVectorize:
         assert design.metadata["artwork_confidence"] == 1.0
         assert len(design.threads) == 2
 
+    def test_force_photo_overrides_flat_classification(self):
+        # The "extract a design from a photo of an already-embroidered
+        # item" upload entry point always sets force_photo=True --
+        # confirm it actually overrides classify_artwork's own vote
+        # (which would otherwise call this clean flat art 'flat') and
+        # still produces a usable design, not a broken one.
+        design = image_to_design(_two_color_png(), width_mm=40, height_mm=40, force_photo=True)
+        assert design.metadata["artwork_kind"] == "photo (forced)"
+        assert design.metadata["artwork_confidence"] == 1.0
+        assert len(design.threads) == 2
+
+    def test_force_photo_ignored_when_auto_vectorize_false(self):
+        design = image_to_design(
+            _two_color_png(), width_mm=40, height_mm=40, force_photo=True, auto_vectorize=False
+        )
+        assert design.metadata["artwork_kind"] == "flat (forced)"
+
     def test_photo_like_gradient_background_no_longer_collapses_to_one_color(self):
         # Regression test for the color-collapse bug this segment's work
         # fixes: a design sitting on a smoothly-shaded (photographic-style)

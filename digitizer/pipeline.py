@@ -89,6 +89,42 @@ from digitizer.stitches.satin.thin_region import (
 _PHOTO_BACKGROUND_BLEND_TOLERANCE = 0.0
 
 
+def _classify_and_artworkify(
+    img: Image.Image, auto_vectorize: bool, force_photo: bool
+) -> tuple[Image.Image, str, float, dict[str, float]]:
+    """Shared flat-vs-photo classification + conditional `artworkify` pass
+    used by both `image_to_design` and `image_to_vector_regions` -- see
+    their own docstrings (and this module's) for the full rationale.
+    Returns `(possibly_artworkified_img, artwork_kind, artwork_confidence,
+    label_grid_kwargs)`, where `label_grid_kwargs` is ready to splat
+    straight into `build_label_grid(...)`.
+    """
+    if not auto_vectorize:
+        return img, "flat (forced)", 1.0, {}
+
+    if force_photo:
+        artwork_kind = "photo (forced)"
+        artwork_confidence = 1.0
+    else:
+        artwork_info = classify_artwork(img)
+        artwork_kind = artwork_info["kind"]
+        artwork_confidence = artwork_info["confidence"]
+
+    label_grid_kwargs: dict[str, float] = {}
+    if _is_photo_kind(artwork_kind):
+        img = artworkify(img)
+        label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
+    return img, artwork_kind, artwork_confidence, label_grid_kwargs
+
+
+def _is_photo_kind(artwork_kind: str) -> bool:
+    """True for either `'photo'` (classify_artwork's own vote) or `'photo
+    (forced)'` (force_photo=True skipped the vote) -- every downstream
+    photo-specific step (artworkify, the background-blend-tolerance
+    override, despeckling) should trigger identically for both."""
+    return artwork_kind.startswith("photo")
+
+
 # Default resolution for the standalone background-removal *preview*
 # (`remove_background_preview` below) -- deliberately much higher than
 # DEFAULT_MAX_DIM (150), since this image is only ever shown to the user
@@ -426,6 +462,7 @@ def image_to_design(
     border_width_mm: float | None = None,
     remove_background: bool = True,
     auto_vectorize: bool = True,
+    force_photo: bool = False,
 ) -> EmbroideryDesign:
     """Digitize a raw image into an EmbroideryDesign of stitch objects, one
     (or more, if a color appears in several disconnected regions) per
@@ -444,6 +481,23 @@ def image_to_design(
     test pinned to the old flat-art-only pipeline, or a caller that already
     knows its input is a clean vector export and wants to skip the
     classification work entirely).
+
+    `force_photo` (default `False`) skips `classify_artwork`'s heuristic
+    vote entirely and always treats the input as `'photo'` (recorded as
+    `'photo (forced)'` in `metadata`, confidence `1.0`) -- for the "extract
+    a design from a photo of an item that's already embroidered" flow
+    (stitch-pro's dedicated upload entry point for that case), where the
+    user has already told us this is a photograph of real stitching, not a
+    flat logo export. This exists because the automatic classifier, while
+    reliable on this project's benchmark library (see classify_artwork's
+    own docstring), is still a heuristic -- a sharply, evenly lit close-up
+    of a design with crisp thread edges can occasionally score closer to
+    'flat' than a typical photo, which would skip the `artworkify`
+    flattening pass this input actually needs. An explicit user signal is
+    strictly more reliable than a guess and costs nothing when it agrees
+    with the guess anyway. No-op (ignored) when `auto_vectorize=False` --
+    that flag's whole point is to skip classification/`artworkify`
+    entirely, which takes precedence over this one.
 
     `density_mm` left as `None` (the default) picks a sensible default for
     whichever `stitch_style` was chosen (see `_DEFAULT_DENSITY_MM_BY_STYLE`)
@@ -495,17 +549,9 @@ def image_to_design(
     px_to_mm_x = width_mm / w
     px_to_mm_y = height_mm / h
 
-    label_grid_kwargs: dict[str, float] = {}
-    if auto_vectorize:
-        artwork_info = classify_artwork(img)
-        artwork_kind = artwork_info["kind"]
-        artwork_confidence = artwork_info["confidence"]
-        if artwork_kind == "photo":
-            img = artworkify(img)
-            label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
-    else:
-        artwork_kind = "flat (forced)"
-        artwork_confidence = 1.0
+    img, artwork_kind, artwork_confidence, label_grid_kwargs = _classify_and_artworkify(
+        img, auto_vectorize, force_photo
+    )
 
     palette_hex, label_grid = build_label_grid(
         img,
@@ -513,7 +559,7 @@ def image_to_design(
         remove_background=remove_background,
         **label_grid_kwargs,
     )
-    if artwork_kind == "photo":
+    if _is_photo_kind(artwork_kind):
         # Collapses the dozens of tiny texture-noise islands a close-up
         # photo's per-thread shading leaves behind (even after artworkify's
         # denoise+posterize) into their surrounding real region, instead of
@@ -556,6 +602,7 @@ def image_to_vector_regions(
     remove_background: bool = True,
     auto_vectorize: bool = True,
     bg_strokes: list[dict] | None = None,
+    force_photo: bool = False,
 ) -> dict:
     """Runs everything `image_to_design` does *up to* (and not including)
     stitch generation -- classify/artworkify, background removal, color
@@ -596,6 +643,10 @@ def image_to_vector_regions(
     is `[outer_ring, *hole_rings]`, exactly like an `EmbroideryObject`'s own
     `geometry` for a FILL/CROSS_STITCH/PUFF_3D region.
 
+    `force_photo` -- see `image_to_design`'s docstring; same meaning here
+    (the "extract a design from a photo of an already-embroidered item"
+    upload entry point sets this unconditionally).
+
     Raises ValueError under the same conditions as `image_to_design`
     (unreadable image, degenerate dimensions, no detectable foreground).
     """
@@ -615,15 +666,9 @@ def image_to_vector_regions(
     px_to_mm_x = width_mm / w
     px_to_mm_y = height_mm / h
 
-    if auto_vectorize:
-        artwork_info = classify_artwork(img)
-        artwork_kind = artwork_info["kind"]
-        artwork_confidence = artwork_info["confidence"]
-        if artwork_kind == "photo":
-            img = artworkify(img)
-    else:
-        artwork_kind = "flat (forced)"
-        artwork_confidence = 1.0
+    img, artwork_kind, artwork_confidence, _photo_label_grid_kwargs = _classify_and_artworkify(
+        img, auto_vectorize, force_photo
+    )
 
     rgba = img.convert("RGBA")
     if remove_background:
@@ -650,11 +695,10 @@ def image_to_vector_regions(
     # function silently produced far worse regions than `image_to_design`
     # for the exact same photographed input, which defeats the whole point
     # of editing a vector that's supposed to represent the same design.
-    label_grid_kwargs: dict[str, float] = {}
-    if artwork_kind == "photo":
-        label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
-    palette_hex, label_grid = build_label_grid(img, max_colors, bg_mask_override=bg_mask, **label_grid_kwargs)
-    if artwork_kind == "photo":
+    palette_hex, label_grid = build_label_grid(
+        img, max_colors, bg_mask_override=bg_mask, **_photo_label_grid_kwargs
+    )
+    if _is_photo_kind(artwork_kind):
         label_grid = despeckle_label_grid(label_grid)
 
     region_records, _total_area_mm2, _threads = _build_region_records(

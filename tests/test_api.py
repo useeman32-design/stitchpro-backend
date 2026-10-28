@@ -92,6 +92,18 @@ class TestImageToPoints:
         assert resp.status_code == 200
         assert resp.get_json()["artworkKind"] == "flat (forced)"
 
+    def test_force_photo_field_overrides_classification(self):
+        client = _client()
+        data = {
+            "image": (io.BytesIO(_png_bytes()), "logo.png"),
+            "width_mm": "40",
+            "height_mm": "40",
+            "force_photo": "true",
+        }
+        resp = client.post("/api/design/image-to-points", data=data, content_type="multipart/form-data")
+        assert resp.status_code == 200
+        assert resp.get_json()["artworkKind"] == "photo (forced)"
+
     def test_invalid_stitch_style_rejected(self):
         client = _client()
         data = {
