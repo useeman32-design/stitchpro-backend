@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
@@ -34,6 +35,44 @@ def _two_color_png() -> bytes:
     d = ImageDraw.Draw(img)
     d.rectangle([10, 10, 50, 50], fill=(200, 30, 30))
     d.rectangle([60, 60, 90, 90], fill=(30, 30, 200))
+    return _png_bytes(img)
+
+
+def _photographed_two_color_patch() -> bytes:
+    """A synthetic stand-in for 'a photo of a real stitched design' (e.g.
+    a monogram actually embroidered onto a shirt, lit unevenly and shot
+    with a phone camera) -- two genuinely distinct foreground colors (not
+    one), each with its own continuous lighting gradient and per-pixel
+    noise, on a plain background, all strong enough that
+    `classify_artwork` calls it `'photo'` (see test_classify_artwork.py's
+    own `_photo_like` for the same noise/gradient recipe).
+
+    This exists specifically to catch the real regression found by hand
+    while validating the real monogram-m.jpg sample asset through the new
+    vectorize screen: `image_to_vector_regions` was missing the same
+    `background_blend_tolerance=0.0` override `image_to_design` already
+    applies for photo-classified input, so a photographed two-thread
+    design collapsed to a single washed-out color plus dozens of
+    texture-noise fragments through the vectorize/region-editor path,
+    while the exact same image digitized correctly (both real colors
+    preserved) through `image_to_design`. The two pipelines sharing this
+    asset's thread/region *color* count is the invariant this guards.
+    """
+    size = 120
+    img = Image.new("RGB", (size, size), (235, 235, 230))
+    rng = np.random.default_rng(7)
+
+    def _noisy_patch(box, base_rgb):
+        x0, y0, x1, y1 = box
+        w, h = x1 - x0, y1 - y0
+        xx, yy = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
+        shade = 1.0 + 0.25 * xx - 0.2 * yy
+        arr = np.stack([base_rgb[c] * shade for c in range(3)], axis=-1)
+        arr += rng.normal(0, 9, arr.shape)
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+
+    img.paste(_noisy_patch((10, 10, 70, 70), (190, 30, 30)), (10, 10))
+    img.paste(_noisy_patch((0, 0, 40, 40), (30, 40, 190)), (65, 65))
     return _png_bytes(img)
 
 
@@ -88,6 +127,29 @@ class TestImageToVectorRegions:
         )
         colors = {r["color_hex"] for r in result["regions"]}
         assert "#ffffff" in colors
+
+    def test_photo_classified_image_keeps_both_real_colors(self):
+        # Regression test for the real bug found validating the new
+        # vectorize screen against monogram-m.jpg (an actual photo of a
+        # stitched design) -- see `_photographed_two_color_patch`'s own
+        # docstring for the full story.
+        img = Image.open(io.BytesIO(_photographed_two_color_patch()))
+        from digitizer.classifier.classify_artwork import classify_artwork
+
+        assert classify_artwork(img)["kind"] == "photo", "fixture must exercise the photo path to be a valid regression test"
+
+        vec_result = image_to_vector_regions(
+            _photographed_two_color_patch(), width_mm=50, height_mm=50, max_colors=6
+        )
+        design = image_to_design(_photographed_two_color_patch(), width_mm=50, height_mm=50, max_colors=6)
+
+        vec_colors = {r["color_hex"] for r in vec_result["regions"]}
+        design_colors = set(design.threads)
+        assert len(vec_colors) >= 2, (
+            f"expected both real colors to survive, got only {vec_colors} -- "
+            "the photo-mode background_blend_tolerance override regressed"
+        )
+        assert vec_colors == design_colors, "vectorize and the real digitize pipeline must agree on a photo's colors"
 
     def test_erase_brush_stroke_shrinks_a_region(self):
         baseline = image_to_vector_regions(_solid_box_png(), width_mm=50, height_mm=50, max_colors=4)

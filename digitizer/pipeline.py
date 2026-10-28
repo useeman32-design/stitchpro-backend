@@ -633,7 +633,27 @@ def image_to_vector_regions(
     if bg_strokes:
         bg_mask = apply_mask_strokes(bg_mask, w, h, bg_strokes)
 
-    palette_hex, label_grid = build_label_grid(img, max_colors, bg_mask_override=bg_mask)
+    # Same fix `image_to_design` already applies for photo-classified input
+    # (see its own docstring and `build_label_grid`'s `background_blend_
+    # tolerance` docstring for the full story): the default tolerance's
+    # cross-color blend-line test assumes a flat logo on a single solid
+    # background, and reliably finds *some* plausible blend path linking
+    # any two unrelated colors once the background itself has many
+    # reference shades (a photographed garment's lighting gradient) --
+    # silently collapsing a genuinely multi-color design (confirmed here:
+    # a two-thread photographed monogram collapsing to one washed-out
+    # color and dozens of texture-noise fragments) down to one color.
+    # `artworkify`'s posterize step already does this rule's job (flattening
+    # real anti-aliasing to discrete levels before quantization), so fully
+    # disabling it here is safe, not just tolerable -- exactly the same
+    # reasoning `image_to_design` already relies on. Without this, this
+    # function silently produced far worse regions than `image_to_design`
+    # for the exact same photographed input, which defeats the whole point
+    # of editing a vector that's supposed to represent the same design.
+    label_grid_kwargs: dict[str, float] = {}
+    if artwork_kind == "photo":
+        label_grid_kwargs["background_blend_tolerance"] = _PHOTO_BACKGROUND_BLEND_TOLERANCE
+    palette_hex, label_grid = build_label_grid(img, max_colors, bg_mask_override=bg_mask, **label_grid_kwargs)
     if artwork_kind == "photo":
         label_grid = despeckle_label_grid(label_grid)
 

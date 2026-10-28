@@ -187,6 +187,24 @@ def _merge_near_duplicate_colors(
             if not background_refs:
                 continue
             for bg in background_refs:
+                # Degenerate case: if `bg` itself already coincides with one
+                # of the two palette colors (within tolerance), the "point
+                # to segment" check below trivially collapses to distance 0
+                # for *any* choice of the other endpoint -- the segment
+                # literally terminates at the query point itself, so this
+                # is not a real "j is an anti-aliased blend between i and
+                # bg" detection, it's just "bg happens to equal j (or i)".
+                # Left unguarded, a single background reference color that
+                # coincidentally matches one real design/palette color
+                # (common once a background has any gradient/shadow/texture
+                # and `reference_colors_from_mask` samples many shades of
+                # it) causes that one palette entry to free-pass-union with
+                # every other palette entry in turn, collapsing the whole
+                # palette to one color. Require both candidates to sit
+                # meaningfully off the background reference itself before
+                # trusting the segment test.
+                if _dist2(palette_rgb[j], bg) <= blend_tol2 or _dist2(palette_rgb[i], bg) <= blend_tol2:
+                    continue
                 if _point_segment_dist2(palette_rgb[j], palette_rgb[i], bg) <= blend_tol2:
                     union(i, j)
                     break

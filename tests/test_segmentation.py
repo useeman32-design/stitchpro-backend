@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from PIL import Image, ImageDraw
 
-from digitizer.segmentation.color_quantize import BACKGROUND_LABEL, build_label_grid, despeckle_label_grid
+from digitizer.segmentation.color_quantize import (
+    BACKGROUND_LABEL,
+    _merge_near_duplicate_colors,
+    build_label_grid,
+    despeckle_label_grid,
+)
 from digitizer.segmentation.polygons import label_grid_to_ring_groups
 
 
@@ -171,6 +176,82 @@ class TestBuildLabelGrid:
             assert len(used_labels) == min(2, max_colors), (
                 f"max_colors={max_colors} produced {len(used_labels)} colors: {palette}"
             )
+
+
+class TestMergeNearDuplicateColorsBackgroundRefCollapse:
+    # Regression test for a real, observed failure distinct from the
+    # anti-aliasing cases above: `image_to_vector_regions`'s
+    # `bg_mask_override` path derives its background reference colors via
+    # `reference_colors_from_mask`, which samples up to 16 shades across
+    # the whole masked-background region (to handle gradients/shadows/
+    # texture) rather than the one-or-few "pure" seed color(s) the
+    # internal `remove_background=True` route tracks. On a background with
+    # any gradient or shadow, one of those 16 sampled shades can
+    # coincidentally land exactly on (or within `blend_tolerance` of) a
+    # real foreground palette color. The blend-line check's "distance from
+    # point `p` to the segment between `a` and `bg`" then degenerates: if
+    # `bg` itself already equals `p`, the segment trivially terminates at
+    # `p`, so the distance is 0 *regardless of which `a` is being tested*
+    # -- not because `p` is really an anti-aliased blend between `a` and
+    # the background, but merely because `p` happens to coincide with one
+    # of the (many) sampled background shades. Left unguarded, that one
+    # palette entry free-passes a merge with literally every other palette
+    # entry in turn, collapsing the entire palette down to a single color
+    # -- the exact "vectorize gives 1 color, image_to_design gives 7-8"
+    # symptom observed on `manual-canvas.jpg` and `cap-logo.jpg`.
+    def test_background_ref_coinciding_with_one_palette_color_does_not_collapse_the_rest(self):
+        # Three clearly-separate "design" colors, none close to each
+        # other. `(50, 50, 50)` stands in for the pathological background
+        # reference that happens to exactly equal one of the palette
+        # entries below (simulating `reference_colors_from_mask` sampling
+        # a background gradient shade that collides with a real
+        # foreground color) -- while `(255, 255, 255)` is a normal, non-
+        # colliding background reference.
+        palette = [(50, 50, 50), (10, 200, 10), (200, 10, 200)]
+        merged, remap = _merge_near_duplicate_colors(
+            palette,
+            merge_tolerance=5.0,
+            background_refs=((255, 255, 255), (50, 50, 50)),
+            blend_tolerance=8.0,
+        )
+        # All three real design colors must survive as distinct entries --
+        # the degenerate background-ref match on entry 0 must not drag the
+        # unrelated entries 1 and 2 into one group with it.
+        assert len(merged) == 3
+        assert remap[0] != remap[1]
+        assert remap[0] != remap[2]
+        assert remap[1] != remap[2]
+
+    def test_vectorize_bg_mask_override_path_matches_remove_background_path(self):
+        # End-to-end version of the same bug via the public
+        # `build_label_grid` entry point: a background with a subtle
+        # gradient (so `reference_colors_from_mask`'s broader sampling
+        # differs from the internal route's own reference) must still
+        # produce the same number of foreground colors whichever way the
+        # background mask was supplied.
+        from digitizer.segmentation.background_removal import compute_background_mask
+
+        img = Image.new("RGB", (60, 60), (240, 240, 240))
+        for y in range(60):
+            for x in range(60):
+                if (x + y) % 7 == 0:
+                    img.putpixel((x, y), (224, 224, 224))  # subtle bg gradient/texture
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([5, 5, 25, 25], fill=(20, 90, 180))
+        draw.rectangle([35, 35, 55, 55], fill=(200, 40, 40))
+
+        rgba = img.convert("RGBA")
+        mask = compute_background_mask(rgba)
+
+        palette_internal, grid_internal = build_label_grid(
+            img, max_colors=6, remove_background=True, background_blend_tolerance=0.0
+        )
+        palette_override, grid_override = build_label_grid(
+            img, max_colors=6, bg_mask_override=mask, background_blend_tolerance=0.0
+        )
+        labels_internal = {v for row in grid_internal for v in row if v != BACKGROUND_LABEL}
+        labels_override = {v for row in grid_override for v in row if v != BACKGROUND_LABEL}
+        assert len(labels_internal) == len(labels_override) == 2
 
 
 class TestLabelGridToRingGroups:
