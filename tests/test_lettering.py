@@ -185,6 +185,46 @@ def io_bytes(data: bytes):
     return io.BytesIO(data)
 
 
+def test_build_text_design_points_bounding_box_matches_declared_size():
+    # Regression test: build_text_design used to pre-center its own
+    # geometry around x=0 *before* handing it to design_to_points, which
+    # itself applies a single `-width_mm/2`/`-height_mm/2` centering
+    # offset on top -- assuming (like every other EmbroideryDesign
+    # producer, e.g. digitizer/pipeline.py's image-to-mm mapping) that it
+    # was given an *origin-based* [0, width_mm] x [0, height_mm] design.
+    # The double-offset was invisible for a short word (a small,
+    # easy-to-miss nudge) but for a longer one it pushed the design's
+    # center a further half-width left of true center -- for a 700mm-wide
+    # business name, that's over 300mm off, pushing most of the design
+    # outside the [0, width_mm] box a client re-centers (x/10 +
+    # width_mm/2) back into for rendering/export. Check that re-centering
+    # a genuinely long, multi-word string lands within its own declared
+    # bounding box (plus a little satin-stroke-width overshoot margin),
+    # not offset by anywhere close to another half-width.
+    from digitizer.points_export import design_to_points
+
+    design = build_text_design("OBI STORES", size_mm=90, color="#5B4FE8")
+    result = design_to_points(design)
+
+    width_mm = result["width_mm"]
+    height_mm = result["height_mm"]
+    # Mirrors stitch-pro's own `pointsToMmSegments`/`toMm`: raw points are
+    # centered at origin; re-add half the declared size to land back in
+    # [0, width_mm] x [0, height_mm] (the box every renderer/hoop uses).
+    recentered_xs = [p["x"] / 10 + width_mm / 2 for p in result["points"]]
+    recentered_ys = [p["y"] / 10 + height_mm / 2 for p in result["points"]]
+
+    # Generous-but-tight margin (10% of each dimension) for satin stroke
+    # width/pull compensation spilling slightly past the skeleton's own
+    # bounding box -- NOT the old bug's ~50%-of-width systematic shift.
+    margin_x = width_mm * 0.1
+    margin_y = height_mm * 0.1
+    assert min(recentered_xs) >= -margin_x
+    assert max(recentered_xs) <= width_mm + margin_x
+    assert min(recentered_ys) >= -margin_y
+    assert max(recentered_ys) <= height_mm + margin_y
+
+
 def test_build_text_design_each_letter_is_a_separate_object_for_routing():
     # Letters should route/jump independently (not be fused into one
     # mega-object), so the machine can trim threads between them if needed

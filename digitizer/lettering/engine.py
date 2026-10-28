@@ -92,13 +92,31 @@ def build_text_design(
         cursor_x += advance + LETTER_GAP_UNITS
     text_width_units = max(0.0, cursor_x - LETTER_GAP_UNITS)
 
-    # Scale to mm and center horizontally around x=0 for a predictable
-    # design bounding box; build one SATIN object per stroke.
-    half_width_mm = (text_width_units * scale) / 2.0
+    # Scale to mm, shifted so the design's own bounding box starts at
+    # (0, 0) -- i.e. origin-based, spanning [0, width_mm] x [0, height_mm]
+    # -- NOT pre-centered around x=0. This has to match the coordinate
+    # convention every *other* EmbroideryDesign producer uses (see
+    # digitizer/pipeline.py's `px_to_mm_x`/`px_to_mm_y`, which map a
+    # rasterized image's own top-left-origin pixel grid straight to
+    # [0, width_mm] x [0, height_mm] with no pre-centering at all):
+    # downstream, both formats/dst/writer.py and digitizer/points_export.py
+    # apply their own single `-width_mm/2` / `-height_mm/2` offset to
+    # *center* whatever design they're given, assuming it starts
+    # origin-based like that. Pre-centering here too meant that single
+    # downstream offset was applied on top of an already-centered design,
+    # shifting the whole result by a further half-width/half-height --
+    # for a short word this was a small, easy-to-miss nudge, but for a
+    # longer one (e.g. a 700mm-wide multi-word business name) it pushed
+    # the *entire* design outside the visible/stitchable [0, width_mm]
+    # bounding box the frontend (and a real embroidery hoop) expects.
+    all_xs = [p[0] for pts in glyph_strokes for p in pts] if glyph_strokes else [0.0]
+    all_ys = [p[1] for pts in glyph_strokes for p in pts] if glyph_strokes else [0.0]
+    min_x_units = min(all_xs)
+    min_y_units = min(all_ys)
     objects: list[EmbroideryObject] = []
     settings = StitchSettings(density_mm=density_mm, pull_compensation_mm=pull_compensation_mm, angle_deg=0.0)
     for i, pts in enumerate(glyph_strokes):
-        scaled = [(x * scale - half_width_mm, y * scale) for x, y in pts]
+        scaled = [((x - min_x_units) * scale, (y - min_y_units) * scale) for x, y in pts]
         geometry = stroke_to_satin_geometry(scaled, width_units=stroke_width_units * scale)
         objects.append(
             EmbroideryObject(
@@ -112,10 +130,8 @@ def build_text_design(
             )
         )
 
-    xs = [p[0] for pts in glyph_strokes for p in pts] if glyph_strokes else [0.0]
-    ys = [p[1] for pts in glyph_strokes for p in pts] if glyph_strokes else [0.0]
-    width_mm = (max(xs) - min(xs)) * scale if xs else size_mm
-    height_mm = (max(ys) - min(ys)) * scale if ys else size_mm
+    width_mm = (max(all_xs) - min_x_units) * scale if glyph_strokes else size_mm
+    height_mm = (max(all_ys) - min_y_units) * scale if glyph_strokes else size_mm
 
     return EmbroideryDesign(
         width_mm=max(width_mm, 1.0),
