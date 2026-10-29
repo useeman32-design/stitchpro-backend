@@ -68,6 +68,24 @@ class TestRemoveBackgroundPreviewFunction:
             return
         raise AssertionError("expected ValueError for undecodable image bytes")
 
+    def test_bg_strokes_restore_makes_a_background_pixel_opaque_again(self):
+        # Erase the whole flat background to transparent first (sanity:
+        # corner pixel starts transparent with no strokes), then confirm a
+        # "restore" stroke centered on that same corner forces it back to
+        # opaque -- the same correction apply_mask_strokes already proves
+        # for image_to_vector_regions, now exercised through this
+        # standalone preview function too.
+        baseline = remove_background_preview(_patch_on_flat_background())
+        baseline_img = Image.open(io.BytesIO(baseline)).convert("RGBA")
+        assert baseline_img.getpixel((5, 5))[3] == 0
+
+        restored = remove_background_preview(
+            _patch_on_flat_background(),
+            bg_strokes=[{"mode": "restore", "radius": 0.1, "points": [[0.05, 0.05]]}],
+        )
+        restored_img = Image.open(io.BytesIO(restored)).convert("RGBA")
+        assert restored_img.getpixel((5, 5))[3] == 255
+
     def test_higher_resolution_than_the_digitizing_pipeline_default(self):
         # A deliberately large flat image -- the digitizing pipeline would
         # downscale this to 150px; the preview should keep far more detail
@@ -161,6 +179,57 @@ class TestRemoveBackgroundEndpoint:
             data={
                 "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
                 "crop": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_bg_strokes_field_accepted_and_changes_output(self):
+        import json
+
+        client = _client()
+        baseline = client.post(
+            "/api/design/remove-background",
+            data={"image": (io.BytesIO(_patch_on_flat_background()), "photo.png")},
+            content_type="multipart/form-data",
+        )
+        baseline_img = Image.open(io.BytesIO(baseline.data)).convert("RGBA")
+        assert baseline_img.getpixel((5, 5))[3] == 0
+
+        strokes = json.dumps([{"mode": "restore", "radius": 0.1, "points": [[0.05, 0.05]]}])
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "bg_strokes": strokes,
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        img = Image.open(io.BytesIO(resp.data)).convert("RGBA")
+        assert img.getpixel((5, 5))[3] == 255
+
+    def test_invalid_bg_strokes_json_is_a_400(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "bg_strokes": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_bg_strokes_not_a_list_is_a_400(self):
+        import json
+
+        client = _client()
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "bg_strokes": json.dumps({"not": "a list"}),
             },
             content_type="multipart/form-data",
         )

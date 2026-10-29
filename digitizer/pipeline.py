@@ -996,7 +996,12 @@ def design_from_region_records(
     )
 
 
-def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM, crop: dict | None = None) -> bytes:
+def remove_background_preview(
+    image_bytes: bytes,
+    max_dim: int = PREVIEW_MAX_DIM,
+    crop: dict | None = None,
+    bg_strokes: list[dict] | None = None,
+) -> bytes:
     """
     Standalone background-removal *preview* step (brief follow-up: "show
     the user what will be extracted from their photo and require an
@@ -1022,6 +1027,16 @@ def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM
     design region (create/auto-digitize/design-region.tsx) rather than the
     whole original photo, once that step has run.
 
+    `bg_strokes` -- see `apply_mask_strokes`; same meaning/shape as
+    `image_to_vector_regions`'s own `bg_strokes` parameter. Without this,
+    a user's manual brush corrections only ever affected the final traced
+    *regions* (since only `image_to_vector_regions` accepted them) while
+    this preview image -- the thing the brush is actually drawn on top of
+    -- never visually reflected the user's own strokes, so "erase this
+    stray bit" looked like it silently did nothing even though it really
+    did change the final result. Passing the same strokes here keeps what
+    the user sees in sync with what they're actually correcting.
+
     Raises ValueError for an unreadable image (same contract as
     `image_to_design`).
     """
@@ -1039,6 +1054,8 @@ def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM
     rgba = img.convert("RGBA")
     mask = compute_background_mask(rgba)
     w, h = rgba.size
+    if bg_strokes:
+        mask = apply_mask_strokes(mask, w, h, bg_strokes)
     px = rgba.load()
     for y in range(h):
         for x in range(w):

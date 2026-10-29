@@ -769,6 +769,13 @@ def remove_background():
                 background mask against just the user-confirmed design
                 region rather than the whole original photo, once that
                 step has run.
+      bg_strokes : optional JSON-encoded string: a list of manual
+                background-mask correction brush strokes, same shape as
+                /api/design/vectorize's own `bg_strokes` (see that route's
+                docstring for the exact per-stroke fields). Lets a client
+                re-preview the mask with the user's own brush corrections
+                already baked in, so what they see here stays in sync with
+                what /api/design/vectorize will actually use.
 
     Returns the PNG directly (mimetype image/png, not a download
     attachment, so a client can drop it straight into an <img>/Image
@@ -807,8 +814,18 @@ def remove_background():
         if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
             return jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400
 
+    raw_strokes = request.form.get("bg_strokes")
+    bg_strokes = None
+    if raw_strokes not in (None, ""):
+        try:
+            bg_strokes = json.loads(raw_strokes)
+        except (TypeError, ValueError):
+            return jsonify({"error": "'bg_strokes' must be valid JSON"}), 400
+        if not isinstance(bg_strokes, list):
+            return jsonify({"error": "'bg_strokes' must be a JSON array"}), 400
+
     try:
-        png_bytes = remove_background_preview(image_file.read(), max_dim=max_dim, crop=crop)
+        png_bytes = remove_background_preview(image_file.read(), max_dim=max_dim, crop=crop, bg_strokes=bg_strokes)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
