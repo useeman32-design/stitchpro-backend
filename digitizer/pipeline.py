@@ -222,6 +222,70 @@ _DEFAULT_PULL_COMPENSATION_MM_BY_STYLE = {
 _APPLIQUE_MIN_DOMINANT_AREA_FRACTION = 0.40
 _APPLIQUE_MIN_CONVEXITY = 0.85
 
+# Noise-speck floor for `_build_region_records`'s own `label_grid_to_ring_
+# groups` call below, in *physical* mm^2 rather than a fixed pixel-space
+# area -- see that function's own `min_area_px` docstring for why a fixed
+# pixel threshold is the wrong unit at all. `label_grid_to_ring_groups`'s
+# own default (4.0px^2) was tuned for this pipeline's old, single working
+# resolution (`DEFAULT_MAX_DIM`, 150px). Once a caller passes a larger
+# `max_dim` -- which a tight `crop` around just a garment photo's design
+# now actually benefits from using, see `_load_image`'s own comment --
+# each pixel covers proportionally *less* physical area, so that same
+# fixed 4.0px^2 threshold silently admits far smaller (sub-visible, pure
+# quantization-noise) specks than it used to, exactly the "the trace is
+# full of stray little shards" regression a naive max_dim increase alone
+# would otherwise cause. Deriving the pixel threshold from a constant
+# *physical* area instead keeps noise filtering consistent no matter what
+# resolution the label grid actually was built at.
+#
+# Benchmarked directly against this project's photographed-compass-logo
+# demo asset (crop+`max_dim=400`, see session notes): swept 0.35/1.0/1.44/
+# 2.0mm^2 and visually compared each render. 0.35mm^2 (a naive "match the
+# *lowest* density the old 4px^2 default implied at any resolution"
+# starting guess) was too lenient -- barely any fewer stray shards than no
+# fix at all. 2.0mm^2 started visibly eating real detail (a letter dropped
+# out of the logo's curved "NAVIGATOR" text). 1.0mm^2 was the largest value
+# that still fully preserved every letter and compass-star point while
+# giving a real, visible reduction in stray background-bleed shards --
+# this is an empirically-chosen value, not a theoretically "correct" one,
+# because this filter is fundamentally trading off against genuinely thin
+# real detail at the same physical scale (see `_scaled_min_component_px`'s
+# own docstring for why this filter's sibling, despeckle, hit that limit
+# even harder and was *not* made resolution-scaled at all).
+_MIN_FOREGROUND_AREA_MM2 = 1.0
+
+
+def _scaled_min_component_px(max_dim: int) -> int:
+    """Deliberately does *not* scale with `max_dim`, unlike
+    `_MIN_FOREGROUND_AREA_MM2` below for `label_grid_to_ring_groups`.
+
+    Tried the same physical-area rescaling here first (scaling
+    `despeckle_label_grid`'s own carefully-benchmarked `min_component_px=4`
+    default up by the resolution ratio, the same fix that's correct for
+    `label_grid_to_ring_groups`'s `min_area_px`) and confirmed by direct
+    visual inspection that it actively destroys real design detail: once
+    `max_dim` is raised enough to finally *resolve* small genuine features
+    like thin text strokes, those strokes are made of just as few pixels as
+    the texture-noise islands this function exists to merge away -- a
+    bigger (area-equivalent) `min_component_px` can't tell "this component
+    is small because it's noise" from "this component is small because
+    it's a real letter's serif, now finally visible at this resolution"
+    apart, and the benchmarked evidence here was a whole word
+    ("NAVIGATOR" on a compass logo) silently disappearing. `label_grid_to_
+    ring_groups`' own `min_area_px`/`min_bbox_mm` filters don't have this
+    problem the same way because they only ever *discard whole isolated
+    regions sitting on the background*, never merge pixels out of a
+    region that's otherwise still partly surviving -- so a thin but long
+    text stroke's many small per-letter *regions* can still each
+    individually clear a physical-area floor even where a short *run* of
+    that same stroke's pixels couldn't clear a component-merge floor.
+    Standing accuracy-first priority means keeping `despeckle_label_grid`
+    at its validated, resolution-independent default rather than trading
+    real detail for a cleaner-looking (but wrong) result.
+    """
+    del max_dim  # intentionally unused -- see docstring
+    return 4
+
 
 def _build_region_records(
     label_grid: list[list[int]],
@@ -248,6 +312,16 @@ def _build_region_records(
         least one traced region (a palette color can end up with zero
         pixels after quantization/despeckling).
     """
+    # See `_MIN_FOREGROUND_AREA_MM2`'s own comment: derive the noise-speck
+    # pixel-area floor from a constant *physical* area instead of using
+    # `label_grid_to_ring_groups`'s fixed-pixel default, so raising
+    # `max_dim` (e.g. for a tightly cropped garment-photo design) doesn't
+    # silently let through a flood of sub-visible quantization-noise specks
+    # that the old fixed threshold happened to catch only by coincidence at
+    # one particular resolution.
+    px_area_mm2 = max(px_to_mm_x * px_to_mm_y, 1e-12)
+    effective_min_area_px = _MIN_FOREGROUND_AREA_MM2 / px_area_mm2
+
     region_records: list[dict] = []
     total_foreground_area_mm2 = 0.0
     threads: list[str] = []
@@ -257,6 +331,7 @@ def _build_region_records(
             color_index,
             px_to_mm_x,
             px_to_mm_y,
+            min_area_px=effective_min_area_px,
             smooth_iterations=3 if smooth_curves else 0,
         )
         if not ring_groups:
@@ -436,11 +511,37 @@ def _region_records_to_objects(
 
 
 def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Image.Image:
+    img = _load_image(image_bytes)
+    return _downscale(img, max_dim)
+
+
+def _load_image(image_bytes: bytes) -> Image.Image:
+    """Just the decode half of `load_and_downscale` -- split out so a caller
+    that also needs to crop (see `_apply_crop`) can do so against the
+    image's real, full resolution *before* any downscaling happens, then
+    downscale the much-smaller cropped result afterwards. Doing it in the
+    other order (downscale the whole original frame first, crop second --
+    this pipeline's own behavior until this fix) silently throws away
+    almost all of a tight crop's detail before tracing ever sees it: e.g.
+    cropping a 130x185px logo out of a 1408x768 photo that's already been
+    downscaled to fit DEFAULT_MAX_DIM=150px end-to-end leaves well under
+    30x25px of actual logo to trace, no matter how high-resolution the
+    original upload was -- exactly the "vectorizing a real garment photo
+    produces unrecognizable blobs" failure this split fixes. `max_dim`
+    always still applies, just to the cropped sub-image's own resolution
+    instead of the original full frame's.
+    """
     img = Image.open(io.BytesIO(image_bytes))
     img.load()
     w, h = img.size
     if w <= 0 or h <= 0:
         raise ValueError("image has zero width or height")
+    return img
+
+
+def _downscale(img: Image.Image, max_dim: int) -> Image.Image:
+    """The resize half of `load_and_downscale` -- see `_load_image`."""
+    w, h = img.size
     scale = min(1.0, max_dim / max(w, h))
     if scale < 1.0:
         new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
@@ -585,10 +686,15 @@ def image_to_design(
         raise ValueError("border_width_mm must be >= 0")
 
     try:
-        img = load_and_downscale(image_bytes, max_dim)
+        img = _load_image(image_bytes)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    # Crop at the image's real, full resolution *before* downscaling (not
+    # after -- see `_load_image`'s own comment for exactly why that order
+    # matters so much for a tight crop around a small part of a large
+    # photo).
     img = _apply_crop(img, crop)
+    img = _downscale(img, max_dim)
 
     w, h = img.size
     px_to_mm_x = width_mm / w
@@ -612,7 +718,9 @@ def image_to_design(
         # despeckle_label_grid's own docstring for why this is a different
         # (and necessary, in addition to) fix from label_grid_to_ring_groups'
         # own min_area_px/min_bbox_mm filters below.
-        label_grid = despeckle_label_grid(label_grid)
+        label_grid = despeckle_label_grid(
+            label_grid, min_component_px=_scaled_min_component_px(max_dim)
+        )
 
     region_records, total_foreground_area_mm2, threads = _build_region_records(
         label_grid, palette_hex, px_to_mm_x, px_to_mm_y, smooth_curves
@@ -710,10 +818,15 @@ def image_to_vector_regions(
         raise ValueError(f"max_dim must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}")
 
     try:
-        img = load_and_downscale(image_bytes, max_dim)
+        img = _load_image(image_bytes)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    # Crop at the image's real, full resolution *before* downscaling (not
+    # after -- see `_load_image`'s own comment for exactly why that order
+    # matters so much for a tight crop around a small part of a large
+    # photo).
     img = _apply_crop(img, crop)
+    img = _downscale(img, max_dim)
 
     w, h = img.size
     px_to_mm_x = width_mm / w
@@ -752,7 +865,9 @@ def image_to_vector_regions(
         img, max_colors, bg_mask_override=bg_mask, **_photo_label_grid_kwargs
     )
     if _is_photo_kind(artwork_kind):
-        label_grid = despeckle_label_grid(label_grid)
+        label_grid = despeckle_label_grid(
+            label_grid, min_component_px=_scaled_min_component_px(max_dim)
+        )
 
     region_records, _total_area_mm2, _threads = _build_region_records(
         label_grid, palette_hex, px_to_mm_x, px_to_mm_y, smooth_curves
@@ -911,10 +1026,15 @@ def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM
     `image_to_design`).
     """
     try:
-        img = load_and_downscale(image_bytes, max_dim)
+        img = _load_image(image_bytes)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    # Crop at the image's real, full resolution *before* downscaling (not
+    # after -- see `_load_image`'s own comment for exactly why that order
+    # matters so much for a tight crop around a small part of a large
+    # photo).
     img = _apply_crop(img, crop)
+    img = _downscale(img, max_dim)
 
     rgba = img.convert("RGBA")
     mask = compute_background_mask(rgba)

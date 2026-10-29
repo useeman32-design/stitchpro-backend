@@ -251,7 +251,6 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         density_mm = _optional_float_field("density_mm")
         border_width_mm = _optional_float_field("border_width_mm")
         angle_deg = _float_field("angle_deg", 0.0)
-        max_dim = _int_field("max_dim", 150)
         smooth_curves = _bool_field("smooth_curves", True)
         remove_background = _bool_field("remove_background", True)
         auto_vectorize = _bool_field("auto_vectorize", True)
@@ -259,6 +258,31 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
         stitch_style = str(form.get("stitch_style") or "fill").strip().lower()
         if stitch_style not in STITCH_STYLES:
             return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
+
+        raw_crop = form.get("crop")
+        crop = None
+        if raw_crop not in (None, ""):
+            try:
+                crop = json.loads(raw_crop)
+            except (TypeError, ValueError):
+                return None, (jsonify({"error": "'crop' must be valid JSON"}), 400)
+            if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
+                return None, (jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400)
+
+        # A caller-confirmed `crop` has already thrown away everything but
+        # the actual design (the "extract only the design" requirement),
+        # so the usual DEFAULT_MAX_DIM=150 -- sized to stay cheap when it's
+        # still downscaling an *entire uncropped photo* -- is needlessly
+        # low once there's only a small sub-image left to resize: see
+        # digitizer.pipeline._MIN_FOREGROUND_AREA_MM2's own comment and
+        # this project's session notes for the benchmarked before/after
+        # (a cropped garment-photo logo going from unrecognizable to
+        # clearly legible at MAX_MAX_DIM, at a near-identical ~0.6s/request
+        # cost precisely because the crop already shrank the working area).
+        # Only applies when the caller didn't already request a specific
+        # max_dim of their own.
+        default_max_dim = MAX_MAX_DIM if crop is not None else 150
+        max_dim = _int_field("max_dim", default_max_dim)
         if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
             return None, (jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400)
 
@@ -880,13 +904,10 @@ def vectorize():
             return jsonify({"error": "'width_mm' and 'height_mm' are required and must be positive"}), 400
 
         max_colors = _int_field("max_colors", 6)
-        max_dim = _int_field("max_dim", 150)
         smooth_curves = _bool_field("smooth_curves", True)
         remove_background_flag = _bool_field("remove_background", True)
         auto_vectorize = _bool_field("auto_vectorize", True)
         force_photo = _bool_field("force_photo", False)
-        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
-            return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
 
         raw_strokes = form.get("bg_strokes")
         bg_strokes = None
@@ -907,6 +928,17 @@ def vectorize():
                 return jsonify({"error": "'crop' must be valid JSON"}), 400
             if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
                 return jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400
+
+        # See the matching comment in `_digitize_image_from_request` --
+        # once a confirmed `crop` has already thrown away everything but
+        # the actual design, this endpoint's own docstring already notes
+        # max_dim "may be raised up to MAX_MAX_DIM for finer traced
+        # detail" is cheap here; do that by default instead of requiring
+        # every caller to know to ask for it explicitly.
+        default_max_dim = MAX_MAX_DIM if crop is not None else 150
+        max_dim = _int_field("max_dim", default_max_dim)
+        if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
+            return jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"invalid numeric field: {e}"}), 400
 
