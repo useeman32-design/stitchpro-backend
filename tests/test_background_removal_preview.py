@@ -138,6 +138,48 @@ class TestRemoveBackgroundEndpoint:
         assert resp.status_code == 400
         assert "error" in resp.get_json()
 
+    def test_crop_field_shrinks_the_output_image(self):
+        import json
+
+        client = _client()
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "crop": json.dumps({"x0": 0.2, "y0": 0.2, "x1": 0.8, "y1": 0.8}),
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        img = Image.open(io.BytesIO(resp.data))
+        assert img.size == (60, 60)  # 0.6 * 100 on each side
+
+    def test_invalid_crop_json_is_a_400(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "crop": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_degenerate_crop_is_a_400(self):
+        import json
+
+        client = _client()
+        resp = client.post(
+            "/api/design/remove-background",
+            data={
+                "image": (io.BytesIO(_patch_on_flat_background()), "photo.png"),
+                "crop": json.dumps({"x0": 0.5, "y0": 0.5, "x1": 0.5, "y1": 0.9}),
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
 
 class TestRemoveBackgroundFlagOnImageToPointsEndpoint:
     def test_remove_background_false_passes_through_and_keeps_backdrop_color(self):

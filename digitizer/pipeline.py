@@ -881,7 +881,7 @@ def design_from_region_records(
     )
 
 
-def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM) -> bytes:
+def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM, crop: dict | None = None) -> bytes:
     """
     Standalone background-removal *preview* step (brief follow-up: "show
     the user what will be extracted from their photo and require an
@@ -902,6 +902,11 @@ def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM
     to stitch geometry, so there's no reason to sacrifice visual fidelity
     for processing speed here the way the stitch pipeline must.
 
+    `crop` -- see `image_to_design`'s docstring; same meaning here. Lets a
+    caller preview the background mask against just the user-confirmed
+    design region (create/auto-digitize/design-region.tsx) rather than the
+    whole original photo, once that step has run.
+
     Raises ValueError for an unreadable image (same contract as
     `image_to_design`).
     """
@@ -909,6 +914,7 @@ def remove_background_preview(image_bytes: bytes, max_dim: int = PREVIEW_MAX_DIM
         img = load_and_downscale(image_bytes, max_dim)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    img = _apply_crop(img, crop)
 
     rgba = img.convert("RGBA")
     mask = compute_background_mask(rgba)

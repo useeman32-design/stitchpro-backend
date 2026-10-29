@@ -738,6 +738,13 @@ def remove_background():
       image   : required, the raw image file (PNG/JPEG/etc).
       max_dim : optional int, caps the longest processed side in pixels,
                 default 900 (digitizer.pipeline.PREVIEW_MAX_DIM).
+      crop    : optional JSON-encoded string: a normalized 0..1
+                {"x0", "y0", "x1", "y1"} box applied before anything else
+                runs -- see /api/design/detect-region and
+                digitizer.pipeline._apply_crop. Lets a client preview the
+                background mask against just the user-confirmed design
+                region rather than the whole original photo, once that
+                step has run.
 
     Returns the PNG directly (mimetype image/png, not a download
     attachment, so a client can drop it straight into an <img>/Image
@@ -766,8 +773,18 @@ def remove_background():
             400,
         )
 
+    raw_crop = request.form.get("crop")
+    crop = None
+    if raw_crop not in (None, ""):
+        try:
+            crop = json.loads(raw_crop)
+        except (TypeError, ValueError):
+            return jsonify({"error": "'crop' must be valid JSON"}), 400
+        if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
+            return jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400
+
     try:
-        png_bytes = remove_background_preview(image_file.read(), max_dim=max_dim)
+        png_bytes = remove_background_preview(image_file.read(), max_dim=max_dim, crop=crop)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
