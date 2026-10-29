@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from flask import Flask, Response, jsonify, request, send_file
 
+from digitizer.classifier.classify_artwork import classify_artwork
 from digitizer.lettering.alphabet_block import glyph_for, is_fully_supported
 from digitizer.lettering.engine import build_text_design
 from digitizer.model import EmbroideryDesign, EmbroideryObject, ObjectType, StitchSettings
@@ -89,8 +90,10 @@ from digitizer.pipeline import (
     design_from_region_records,
     image_to_design,
     image_to_vector_regions,
+    load_and_downscale,
     remove_background_preview,
 )
+from digitizer.segmentation.design_region import detect_design_region
 from digitizer.points_export import design_to_points
 from formats.dst.writer import design_to_dst_bytes
 from formats.writer import SUPPORTED_FORMATS, design_to_format_bytes, points_to_format_bytes
@@ -586,6 +589,118 @@ def text_to_points():
     return jsonify(result)
 
 
+@app.post("/api/design/detect-region")
+def detect_region():
+    """
+    Suggests a crop box isolating just the printed/stitched design within
+    a photo -- brief: "when creating with [a] real world photo, example
+    clothes on someone, it's supposed to detect it and extract only the
+    design... but now it's just removing the background normally and
+    trying to convert to vector which will give very bad result".
+
+    Unlike /api/design/remove-background (which only strips *border-
+    connected* surrounding material -- a studio backdrop, a flat-lay's
+    table), a photo of someone *wearing* the garment has the shirt's own
+    plain fabric (and skin/face/arms) filling most or all of the frame,
+    none of which is "surrounding material" by that definition. This route
+    runs digitizer.segmentation.design_region.detect_design_region, which
+    looks *within* the foreground for the sub-region that actually looks
+    like a design (more local color/edge detail than the large flat areas
+    around it), and returns its bounding box as a plain JSON suggestion --
+    never applied automatically. A client is expected to show this as an
+    adjustable crop overlay the user confirms or resizes before anything
+    is actually cropped, matching the same explicit-confirmation pattern
+    /api/design/remove-background's own preview already establishes.
+
+    Also runs the same flat-vs-photo classification
+    (digitizer.classifier.classify_artwork) used elsewhere in this
+    pipeline and includes it in the response: a clean flat-art logo export
+    (not a photo at all) has no "garment vs. design" distinction to make,
+    so a confidently-`'flat'`-classified image comes back with
+    `"skip": true` and a harmless full-image box, signaling the client to
+    skip showing this crop step entirely rather than risk cropping a
+    flat design down to some arbitrary sub-region. Pass `force_photo=true`
+    (same meaning as the digitize/vectorize endpoints) for an upload entry
+    point that's already told us this is a photograph, to skip that
+    classification vote and always run real detection.
+
+    Multipart form-data request:
+      image       : required, the raw image file (PNG/JPEG/etc).
+      max_dim     : optional int, caps the longest processed side in
+                    pixels before detection runs its own further internal
+                    downsample, default 900 (digitizer.pipeline.
+                    PREVIEW_MAX_DIM) -- detection quality is insensitive to
+                    this beyond a few hundred px, it mainly exists so a
+                    huge original upload doesn't get fully decoded/resized
+                    twice at full resolution for no benefit.
+      force_photo : optional bool, default false -- see above.
+
+    Response JSON on success:
+      {"x0", "y0", "x1", "y1": normalized 0..1 box,
+       "confidence": 0..1,
+       "skip": bool -- true when classified confidently 'flat' (see above),
+       "artworkKind", "artworkConfidence": the classify_artwork result}
+
+    Or {"error": "..."} with a 400 status on a missing/unreadable image or
+    an out-of-range max_dim.
+    """
+    image_file = request.files.get("image")
+    if image_file is None or image_file.filename == "":
+        return jsonify({"error": "'image' file field is required"}), 400
+
+    raw_max_dim = request.form.get("max_dim")
+    try:
+        max_dim = PREVIEW_MAX_DIM if raw_max_dim in (None, "") else int(raw_max_dim)
+    except (TypeError, ValueError):
+        return jsonify({"error": "'max_dim' must be an integer"}), 400
+    if not (PREVIEW_MIN_MAX_DIM <= max_dim <= PREVIEW_MAX_MAX_DIM):
+        return (
+            jsonify({"error": f"'max_dim' must be between {PREVIEW_MIN_MAX_DIM} and {PREVIEW_MAX_MAX_DIM}"}),
+            400,
+        )
+    force_photo = str(request.form.get("force_photo", "")).strip().lower() not in ("", "0", "false", "no")
+
+    try:
+        img = load_and_downscale(image_file.read(), max_dim=max_dim)
+    except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
+        return jsonify({"error": f"could not read image: {e}"}), 400
+
+    if force_photo:
+        artwork_kind, artwork_confidence = "photo (forced)", 1.0
+    else:
+        artwork_info = classify_artwork(img)
+        artwork_kind, artwork_confidence = artwork_info["kind"], artwork_info["confidence"]
+
+    is_confidently_flat = artwork_kind == "flat" and artwork_confidence >= 0.5
+    if is_confidently_flat:
+        return jsonify(
+            {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 1.0,
+                "y1": 1.0,
+                "confidence": 0.0,
+                "skip": True,
+                "artworkKind": artwork_kind,
+                "artworkConfidence": artwork_confidence,
+            }
+        )
+
+    region = detect_design_region(img)
+    return jsonify(
+        {
+            "x0": region["x0"],
+            "y0": region["y0"],
+            "x1": region["x1"],
+            "y1": region["y1"],
+            "confidence": region["confidence"],
+            "skip": False,
+            "artworkKind": artwork_kind,
+            "artworkConfidence": artwork_confidence,
+        }
+    )
+
+
 @app.post("/api/design/remove-background")
 def remove_background():
     """
@@ -682,6 +797,15 @@ def vectorize():
                           requirement. See
                           digitizer.segmentation.background_removal.
                           apply_mask_strokes for the exact semantics.
+      crop             : optional JSON-encoded string: a normalized 0..1
+                          {"x0", "y0", "x1", "y1"} box applied before
+                          anything else runs -- see /api/design/
+                          detect-region and digitizer.pipeline._apply_crop.
+                          The "extract only the design from a photo of
+                          someone wearing the garment" requirement: pass
+                          the box the user confirmed/adjusted on that
+                          suggestion, never one applied without them
+                          seeing/approving it first.
 
     Response JSON on success:
       {"widthMm", "heightMm", "artworkKind", "artworkConfidence",
@@ -738,6 +862,16 @@ def vectorize():
                 return jsonify({"error": "'bg_strokes' must be valid JSON"}), 400
             if not isinstance(bg_strokes, list):
                 return jsonify({"error": "'bg_strokes' must be a JSON array"}), 400
+
+        raw_crop = form.get("crop")
+        crop = None
+        if raw_crop not in (None, ""):
+            try:
+                crop = json.loads(raw_crop)
+            except (TypeError, ValueError):
+                return jsonify({"error": "'crop' must be valid JSON"}), 400
+            if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
+                return jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400
     except (TypeError, ValueError) as e:
         return jsonify({"error": f"invalid numeric field: {e}"}), 400
 
@@ -753,6 +887,7 @@ def vectorize():
             auto_vectorize=auto_vectorize,
             bg_strokes=bg_strokes,
             force_photo=force_photo,
+            crop=crop,
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400

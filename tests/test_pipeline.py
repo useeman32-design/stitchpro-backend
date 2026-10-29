@@ -144,6 +144,45 @@ class TestImageToDesign:
         assert len(unsmoothed.objects) == 1
 
 
+class TestCrop:
+    """Tests for the `crop` parameter (see pipeline._apply_crop and
+    digitizer.segmentation.design_region) -- the "extract only the design
+    from a photo of someone wearing the garment" entry point."""
+
+    def test_crop_none_is_a_true_no_op(self):
+        baseline = image_to_design(_two_color_png(), width_mm=50, height_mm=50, max_colors=4)
+        explicit_none = image_to_design(_two_color_png(), width_mm=50, height_mm=50, max_colors=4, crop=None)
+        assert baseline.threads == explicit_none.threads
+        assert len(baseline.objects) == len(explicit_none.objects)
+
+    def test_crop_isolates_only_the_cropped_color(self):
+        # Same two-color fixture as test_vectorize_pipeline.py's own crop
+        # test -- red box at roughly [10,10]-[50,50], blue at [60,60]-
+        # [90,90] on a 100x100 canvas. Cropping tightly around just the
+        # red box should leave only red thread behind.
+        crop = {"x0": 0.0, "y0": 0.0, "x1": 0.55, "y1": 0.55}
+        design = image_to_design(_two_color_png(), width_mm=50, height_mm=50, max_colors=4, crop=crop)
+        assert "#1e1ec8" not in design.threads, "the blue region should have been cropped away entirely"
+
+    def test_degenerate_crop_raises_value_error(self):
+        with pytest.raises(ValueError):
+            image_to_design(
+                _two_color_png(),
+                width_mm=50,
+                height_mm=50,
+                max_colors=4,
+                crop={"x0": 0.5, "y0": 0.5, "x1": 0.5, "y1": 0.9},
+            )
+
+    def test_cropped_design_still_spans_requested_width_height_mm(self):
+        # The crop should size the *output* to width_mm/height_mm exactly
+        # as if the cropped sub-image were the entire original upload.
+        crop = {"x0": 0.0, "y0": 0.0, "x1": 0.55, "y1": 0.55}
+        design = image_to_design(_two_color_png(), width_mm=33, height_mm=27, max_colors=4, crop=crop)
+        assert design.width_mm == 33
+        assert design.height_mm == 27
+
+
 class TestAutoVectorize:
     """Tests for the `auto_vectorize` classify-then-artworkify step (see
     pipeline.py's module docstring) and the `artwork_kind`/

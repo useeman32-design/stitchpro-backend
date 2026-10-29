@@ -208,6 +208,39 @@ class TestImageToVectorRegions:
         )
         assert len(result["regions"]) >= 1
 
+    def test_crop_none_is_a_true_no_op(self):
+        # Regression safety for the new `crop` passthrough (see
+        # digitizer.segmentation.design_region / pipeline._apply_crop):
+        # an explicit crop=None must behave identically to the parameter
+        # not existing at all.
+        baseline = image_to_vector_regions(_two_color_png(), width_mm=50, height_mm=50, max_colors=4)
+        explicit_none = image_to_vector_regions(
+            _two_color_png(), width_mm=50, height_mm=50, max_colors=4, crop=None
+        )
+        assert baseline["regions"] == explicit_none["regions"]
+
+    def test_crop_isolates_only_the_cropped_color(self):
+        # _two_color_png has a red box at roughly [10,10]-[50,50] and a
+        # blue box at [60,60]-[90,90] on a 100x100 canvas -- cropping
+        # tightly around just the red box should leave only red behind.
+        crop = {"x0": 0.0, "y0": 0.0, "x1": 0.55, "y1": 0.55}
+        result = image_to_vector_regions(
+            _two_color_png(), width_mm=50, height_mm=50, max_colors=4, crop=crop
+        )
+        colors = {r["color_hex"] for r in result["regions"]}
+        assert "#c81e1e" in colors or any(c != "#1e1ec8" for c in colors)
+        assert "#1e1ec8" not in colors, "the blue region should have been cropped away entirely"
+
+    def test_degenerate_crop_raises_value_error(self):
+        with pytest.raises(ValueError):
+            image_to_vector_regions(
+                _two_color_png(),
+                width_mm=50,
+                height_mm=50,
+                max_colors=4,
+                crop={"x0": 0.5, "y0": 0.5, "x1": 0.5, "y1": 0.9},
+            )
+
 
 class TestApplyMaskStrokes:
     def test_no_strokes_returns_same_mask_values(self):
@@ -358,6 +391,53 @@ class TestVectorizeEndpoint:
                 "width_mm": "50",
                 "height_mm": "50",
                 "bg_strokes": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_crop_field_isolates_only_the_cropped_color(self):
+        client = _client()
+        crop = json.dumps({"x0": 0.0, "y0": 0.0, "x1": 0.55, "y1": 0.55})
+        resp = client.post(
+            "/api/design/vectorize",
+            data={
+                "image": (io.BytesIO(_two_color_png()), "logo.png"),
+                "width_mm": "50",
+                "height_mm": "50",
+                "max_colors": "4",
+                "crop": crop,
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        body = resp.get_json()
+        colors = {r["colorHex"] for r in body["regions"]}
+        assert "#1e1ec8" not in colors
+
+    def test_invalid_crop_json_is_400(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/vectorize",
+            data={
+                "image": (io.BytesIO(_two_color_png()), "logo.png"),
+                "width_mm": "50",
+                "height_mm": "50",
+                "crop": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_crop_missing_keys_is_400(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/vectorize",
+            data={
+                "image": (io.BytesIO(_two_color_png()), "logo.png"),
+                "width_mm": "50",
+                "height_mm": "50",
+                "crop": json.dumps({"x0": 0.0, "y0": 0.0}),
             },
             content_type="multipart/form-data",
         )

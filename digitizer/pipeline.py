@@ -448,6 +448,37 @@ def load_and_downscale(image_bytes: bytes, max_dim: int = DEFAULT_MAX_DIM) -> Im
     return img
 
 
+def _apply_crop(img: Image.Image, crop: dict | None) -> Image.Image:
+    """Crops `img` to a normalized (0..1) `{"x0", "y0", "x1", "y1"}` box
+    (see digitizer.segmentation.design_region.detect_design_region) before
+    anything else in the pipeline sees it -- the "extract only the design
+    from a photo of someone wearing the garment" requirement: the rest of
+    the pipeline (classification, background removal, quantization) is
+    completely unchanged, it just now only ever sees the sub-image the
+    user confirmed actually contains the design, instead of the whole
+    person+garment+background frame.
+
+    No-op when `crop` is `None` (every existing caller that doesn't pass
+    it keeps today's exact behavior). Raises `ValueError` for a
+    degenerate box (`x1 <= x0` or `y1 <= y0` after clamping to the image),
+    same failure style as this module's other input validation.
+    """
+    if crop is None:
+        return img
+    w, h = img.size
+    x0 = max(0.0, min(1.0, float(crop.get("x0", 0.0))))
+    y0 = max(0.0, min(1.0, float(crop.get("y0", 0.0))))
+    x1 = max(0.0, min(1.0, float(crop.get("x1", 1.0))))
+    y1 = max(0.0, min(1.0, float(crop.get("y1", 1.0))))
+    left = round(x0 * w)
+    top = round(y0 * h)
+    right = round(x1 * w)
+    bottom = round(y1 * h)
+    if right <= left or bottom <= top:
+        raise ValueError("crop box is degenerate (x1/y1 must be greater than x0/y0 after clamping)")
+    return img.crop((left, top, right, bottom))
+
+
 def image_to_design(
     image_bytes: bytes,
     width_mm: float,
@@ -463,6 +494,7 @@ def image_to_design(
     remove_background: bool = True,
     auto_vectorize: bool = True,
     force_photo: bool = False,
+    crop: dict | None = None,
 ) -> EmbroideryDesign:
     """Digitize a raw image into an EmbroideryDesign of stitch objects, one
     (or more, if a color appears in several disconnected regions) per
@@ -509,6 +541,18 @@ def image_to_design(
     region's outline and holes for FILL, none for CROSS_STITCH. Pass `0`
     explicitly to disable it for FILL too.
 
+    `crop` (default `None`), when given, is a normalized (0..1)
+    `{"x0", "y0", "x1", "y1"}` box applied before anything else below ever
+    runs -- see digitizer.segmentation.design_region.detect_design_region
+    and pipeline._apply_crop. This is the "extract only the design from a
+    photo of someone wearing the garment" entry point: a caller first gets
+    a suggested box from `detect_design_region`, shows it to the user as
+    an adjustable crop they confirm or resize (never applied silently --
+    same standing rule as `remove_background`'s own preview step), and
+    only then passes the confirmed box here. `width_mm`/`height_mm` size
+    the *cropped* result, exactly as if the uploaded photo had only ever
+    contained that sub-region to begin with.
+
     `remove_background` (default `True`) runs the same border-connected
     flood-fill background/surrounding-material removal
     (digitizer.segmentation.background_removal) the standalone
@@ -544,6 +588,7 @@ def image_to_design(
         img = load_and_downscale(image_bytes, max_dim)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    img = _apply_crop(img, crop)
 
     w, h = img.size
     px_to_mm_x = width_mm / w
@@ -603,6 +648,7 @@ def image_to_vector_regions(
     auto_vectorize: bool = True,
     bg_strokes: list[dict] | None = None,
     force_photo: bool = False,
+    crop: dict | None = None,
 ) -> dict:
     """Runs everything `image_to_design` does *up to* (and not including)
     stitch generation -- classify/artworkify, background removal, color
@@ -647,6 +693,12 @@ def image_to_vector_regions(
     (the "extract a design from a photo of an already-embroidered item"
     upload entry point sets this unconditionally).
 
+    `crop` -- see `image_to_design`'s docstring; same meaning here (the
+    "extract only the design from a photo of someone wearing the garment"
+    requirement -- a caller gets a suggested box from
+    digitizer.segmentation.design_region.detect_design_region, the user
+    confirms/adjusts it, and only the confirmed box is passed here).
+
     Raises ValueError under the same conditions as `image_to_design`
     (unreadable image, degenerate dimensions, no detectable foreground).
     """
@@ -661,6 +713,7 @@ def image_to_vector_regions(
         img = load_and_downscale(image_bytes, max_dim)
     except Exception as e:  # noqa: BLE001 - Pillow raises several distinct error types
         raise ValueError(f"could not read image: {e}") from e
+    img = _apply_crop(img, crop)
 
     w, h = img.size
     px_to_mm_x = width_mm / w
