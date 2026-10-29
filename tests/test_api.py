@@ -153,6 +153,63 @@ class TestImageToPoints:
         resp = client.post("/api/design/image-to-points", data=data, content_type="multipart/form-data")
         assert resp.status_code == 200
 
+    def test_crop_field_accepted_and_narrows_the_design(self):
+        # _png_bytes draws its one blue square at [20,20]-[80,80] on a
+        # 100x100 canvas -- cropping tightly to just that square (with the
+        # design still fully inside) should keep exactly one thread color.
+        client = _client()
+        baseline = client.post(
+            "/api/design/image-to-points",
+            data={"image": (io.BytesIO(_png_bytes()), "logo.png"), "width_mm": "40", "height_mm": "40"},
+            content_type="multipart/form-data",
+        ).get_json()
+        assert baseline["threads"] == ["#1e78c8"]
+
+        import json
+
+        cropped = client.post(
+            "/api/design/image-to-points",
+            data={
+                "image": (io.BytesIO(_png_bytes()), "logo.png"),
+                "width_mm": "40",
+                "height_mm": "40",
+                "crop": json.dumps({"x0": 0.1, "y0": 0.1, "x1": 0.9, "y1": 0.9}),
+            },
+            content_type="multipart/form-data",
+        )
+        assert cropped.status_code == 200
+        assert cropped.get_json()["threads"] == ["#1e78c8"]
+
+    def test_invalid_crop_json_is_400(self):
+        client = _client()
+        resp = client.post(
+            "/api/design/image-to-points",
+            data={
+                "image": (io.BytesIO(_png_bytes()), "logo.png"),
+                "width_mm": "40",
+                "height_mm": "40",
+                "crop": "{not valid json",
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
+    def test_degenerate_crop_is_400(self):
+        import json
+
+        client = _client()
+        resp = client.post(
+            "/api/design/image-to-points",
+            data={
+                "image": (io.BytesIO(_png_bytes()), "logo.png"),
+                "width_mm": "40",
+                "height_mm": "40",
+                "crop": json.dumps({"x0": 0.5, "y0": 0.5, "x1": 0.5, "y1": 0.9}),
+            },
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+
 
 class TestImageToFile:
     def test_cross_stitch_download(self):

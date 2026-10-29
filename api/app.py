@@ -261,6 +261,16 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             return None, (jsonify({"error": f"'stitch_style' must be one of {list(STITCH_STYLES)}"}), 400)
         if not (MIN_MAX_DIM <= max_dim <= MAX_MAX_DIM):
             return None, (jsonify({"error": f"'max_dim' must be between {MIN_MAX_DIM} and {MAX_MAX_DIM}"}), 400)
+
+        raw_crop = form.get("crop")
+        crop = None
+        if raw_crop not in (None, ""):
+            try:
+                crop = json.loads(raw_crop)
+            except (TypeError, ValueError):
+                return None, (jsonify({"error": "'crop' must be valid JSON"}), 400)
+            if not isinstance(crop, dict) or not all(k in crop for k in ("x0", "y0", "x1", "y1")):
+                return None, (jsonify({"error": "'crop' must be a JSON object with x0/y0/x1/y1"}), 400)
     except (TypeError, ValueError) as e:
         return None, (jsonify({"error": f"invalid numeric field: {e}"}), 400)
 
@@ -280,6 +290,7 @@ def _digitize_image_from_request() -> tuple[EmbroideryDesign | None, tuple | Non
             remove_background=remove_background,
             auto_vectorize=auto_vectorize,
             force_photo=force_photo,
+            crop=crop,
         )
     except ValueError as e:
         return None, (jsonify({"error": str(e)}), 400)
@@ -353,6 +364,13 @@ def image_to_file():
                          pixels) actually processed, default 150 -- keeps
                          server-side processing cheap regardless of the
                          uploaded image's real resolution.
+      crop            : optional JSON-encoded string: a normalized 0..1
+                         {"x0", "y0", "x1", "y1"} box applied before
+                         anything else runs -- see /api/design/
+                         detect-region and digitizer.pipeline._apply_crop.
+                         The "extract only the design from a photo of
+                         someone wearing the garment" requirement; pass
+                         only a box the user already confirmed/adjusted.
       name            : optional, used for the download filename.
 
     Returns the file as a binary attachment download on success, or
