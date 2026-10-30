@@ -176,22 +176,71 @@ def _reject_color_tunnels(
     return out
 
 
-def _representative_colors(colors: list[Rgb], max_colors: int) -> list[Rgb]:
+# Bug-fix constant (see the module docstring's new "Known failure mode"
+# section below): when building the *border*-seed reference palette, a
+# color cluster has to make up at least this fraction of all border/
+# transparency seed samples to be trusted as "the real background". A
+# cluster below this share is far more likely to be a real foreground
+# design that happens to touch the edge (a deliberate full-bleed logo, a
+# tightly-cropped photo, a sampler/cross-stitch pattern drawn edge-to-edge)
+# than an actual secondary backdrop color -- a genuine backdrop (even a
+# multi-tone one, e.g. a gradient or two-tone studio background) is, by
+# the very assumption this whole technique rests on, supposed to make up
+# the *overwhelming majority* of the border. Only applied to the
+# border-seeded palette in `compute_background_mask_and_reference`; does
+# NOT apply to `reference_colors_from_mask`'s unrelated, already-trusted
+# use case (building reference colors from an already-decided/corrected
+# mask), so that caller's behavior is unchanged.
+_BORDER_REFERENCE_MIN_SHARE = 0.20
+
+
+def _representative_colors(colors: list[Rgb], max_colors: int, *, min_share: float = 0.0) -> list[Rgb]:
     """Reduces `colors` (can be many thousands of samples from a gradient
     background) down to at most `max_colors` representative swatches, so
     the enclosed-hole pass below can cheaply check each interior pixel
     against a handful of reference colors instead of the whole background
-    pixel population."""
+    pixel population.
+
+    `min_share`, if given, drops any resulting color whose own samples make
+    up less than that fraction of `colors` overall -- see
+    `_BORDER_REFERENCE_MIN_SHARE`'s docstring for why. Never returns an
+    empty list for a non-empty `colors` input purely because of this
+    filter: if every cluster falls below `min_share` (a genuinely
+    all-over-the-place border with no single dominant tone), the single
+    largest cluster is kept anyway, so the hole pass still has *something*
+    to work with rather than being silently disabled.
+    """
     if not colors:
         return []
     if len(colors) <= max_colors:
-        return list(dict.fromkeys(colors))
+        unique = list(dict.fromkeys(colors))
+        if min_share <= 0.0 or len(unique) <= 1:
+            return unique
+        counts = {c: colors.count(c) for c in unique}
+        total = len(colors)
+        kept = [c for c in unique if counts[c] / total >= min_share]
+        return kept or [max(unique, key=lambda c: counts[c])]
+
     strip = Image.new("RGB", (len(colors), 1))
     strip.putdata(colors)
     quantized = strip.quantize(colors=max_colors, method=Image.Quantize.MEDIANCUT)
     palette = quantized.getpalette() or []
     n = min(max_colors, len(palette) // 3)
-    return [(palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]) for i in range(n)]
+    swatches = [(palette[i * 3], palette[i * 3 + 1], palette[i * 3 + 2]) for i in range(n)]
+    if min_share <= 0.0:
+        return swatches
+
+    index_counts: dict[int, int] = {}
+    get_flattened = getattr(quantized, "get_flattened_data", None)
+    flattened = get_flattened() if get_flattened is not None else quantized.getdata()
+    for idx in flattened:
+        index_counts[idx] = index_counts.get(idx, 0) + 1
+    total = len(colors)
+    kept = [swatches[i] for i in range(n) if index_counts.get(i, 0) / total >= min_share]
+    if kept:
+        return kept
+    best_i = max(range(n), key=lambda i: index_counts.get(i, 0))
+    return [swatches[best_i]]
 
 
 def reference_colors_from_mask(rgba: Image.Image, mask: list[list[bool]], max_colors: int = 16) -> list[Rgb]:
@@ -356,7 +405,14 @@ def compute_background_mask_and_reference(
     w, h = img.size
 
     connected, trusted, seed_colors = _flood_fill_connected_background(img, alpha_threshold, step_tolerance)
-    reference = _representative_colors(seed_colors, max_colors=16)
+    # `min_share=_BORDER_REFERENCE_MIN_SHARE`: see that constant's docstring
+    # -- this is the fix for the "a foreground color touching the image
+    # edge contaminates the trusted background palette" bug. Only a color
+    # that makes up a real majority-ish share of the border/transparency
+    # seed samples is trusted as genuine background; a minority color
+    # (most likely a real design bleeding to the edge) is dropped instead
+    # of poisoning `reference` for the rest of this function.
+    reference = _representative_colors(seed_colors, max_colors=16, min_share=_BORDER_REFERENCE_MIN_SHARE)
 
     mask = _reject_color_tunnels(img, connected, trusted, reference, alpha_threshold, tunnel_tolerance)
 
